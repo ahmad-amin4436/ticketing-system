@@ -1,0 +1,304 @@
+using System.Drawing;
+using System.Windows.Forms;
+
+namespace indian_ticketing;
+
+public partial class Form1 : Form
+{
+    private readonly TrainScraper _scraper = new();
+
+    // erail.in train-type colours
+    private static readonly Color ColRajdhani  = Color.FromArgb(0xFF, 0x48, 0x0B);
+    private static readonly Color ColSuperfast = Color.FromArgb(0xD5, 0x6A, 0x00);
+    private static readonly Color ColGaribRath = Color.FromArgb(0x00, 0x80, 0x00);
+    private static readonly Color ColMail      = Color.FromArgb(0x8B, 0x45, 0x13);
+    private static readonly Color ColDefault   = Color.Black;
+
+    // Selected station state
+    private (string Name, string Code)? _fromStn;
+    private (string Name, string Code)? _toStn;
+
+    // Autocomplete drop-down controls (created in code, not designer)
+    private Panel   _fromDropPanel = null!;
+    private ListBox _fromDropList  = null!;
+    private Panel   _toDropPanel   = null!;
+    private ListBox _toDropList    = null!;
+    private bool    _suppressAC    = false;
+
+    public Form1()
+    {
+        InitializeComponent();
+        BuildColumns();
+        dgvTrains.CellFormatting += DgvTrains_CellFormatting;
+        InitAutocomplete();
+    }
+
+    // ── Autocomplete ─────────────────────────────────────────────────────────
+    private void InitAutocomplete()
+    {
+        (_fromDropPanel, _fromDropList) = CreateDropdown();
+        (_toDropPanel,   _toDropList)   = CreateDropdown();
+
+        WireAutocomplete(txtFrom, _fromDropPanel, _fromDropList,
+            v => { _fromStn = v; });
+        WireAutocomplete(txtTo,   _toDropPanel,   _toDropList,
+            v => { _toStn   = v; });
+    }
+
+    private (Panel panel, ListBox list) CreateDropdown()
+    {
+        var list = new ListBox
+        {
+            Dock        = DockStyle.Fill,
+            BorderStyle = BorderStyle.None,
+            Font        = new Font("Segoe UI", 9F),
+            ItemHeight  = 20,
+        };
+        var panel = new Panel
+        {
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor   = Color.White,
+            Visible     = false,
+        };
+        panel.Controls.Add(list);
+        Controls.Add(panel);
+        panel.BringToFront();
+        return (panel, list);
+    }
+
+    private void WireAutocomplete(
+        TextBox txt, Panel panel, ListBox list,
+        Action<(string Name, string Code)?> setStation)
+    {
+        txt.TextChanged += (_, _) =>
+        {
+            if (_suppressAC) return;
+            setStation(null);
+            ShowSuggestions(txt, panel, list);
+        };
+
+        txt.KeyDown += (_, e) =>
+        {
+            if (!panel.Visible) return;
+            switch (e.KeyCode)
+            {
+                case Keys.Down:
+                    list.SelectedIndex = Math.Min(list.SelectedIndex + 1, list.Items.Count - 1);
+                    e.Handled = true; break;
+                case Keys.Up:
+                    list.SelectedIndex = Math.Max(list.SelectedIndex - 1, 0);
+                    e.Handled = true; break;
+                case Keys.Enter when list.SelectedIndex >= 0:
+                    PickItem(panel, list, txt, setStation);
+                    e.SuppressKeyPress = true; break;
+                case Keys.Escape:
+                    panel.Visible = false;
+                    e.Handled = true; break;
+            }
+        };
+
+        list.MouseClick += (_, _) => PickItem(panel, list, txt, setStation);
+
+        txt.Leave += async (_, _) =>
+        {
+            await Task.Delay(180);
+            if (!IsDisposed) panel.Invoke(() => panel.Visible = false);
+        };
+    }
+
+    private void ShowSuggestions(TextBox txt, Panel panel, ListBox list)
+    {
+        var q = txt.Text.Trim();
+        var results = StationData.Search(q).ToList();
+        if (results.Count == 0) { panel.Visible = false; return; }
+
+        list.Items.Clear();
+        foreach (var (name, code) in results)
+            list.Items.Add($"{name} ({code})");
+
+        var pt  = txt.Parent!.PointToScreen(new Point(txt.Left, txt.Bottom));
+        var fp  = PointToClient(pt);
+        int h   = Math.Min(results.Count * list.ItemHeight + 4, 200);
+        panel.SetBounds(fp.X, fp.Y, Math.Max(txt.Width + 30, 260), h);
+        panel.Visible = true;
+        panel.BringToFront();
+    }
+
+    private void PickItem(
+        Panel panel, ListBox list, TextBox txt,
+        Action<(string Name, string Code)?> setStation)
+    {
+        if (list.SelectedIndex < 0) return;
+        var text = list.Items[list.SelectedIndex]!.ToString()!;
+        var op   = text.LastIndexOf(" (");
+        if (op > 0 && text.EndsWith(")"))
+        {
+            var name = text[..op];
+            var code = text[(op + 2)..^1];
+            setStation((name, code));
+            _suppressAC = true;
+            txt.Text    = text;
+            _suppressAC = false;
+        }
+        panel.Visible = false;
+    }
+
+    // ── Parse station from textbox text (fallback when user types code only) ──
+    private static (string Name, string Code) ResolveStation(
+        TextBox txt, (string Name, string Code)? stored)
+    {
+        if (stored.HasValue) return stored.Value;
+
+        var t  = txt.Text.Trim();
+        var op = t.LastIndexOf(" (");
+        if (op > 0 && t.EndsWith(")"))
+            return (t[..op], t[(op + 2)..^1].ToUpperInvariant());
+
+        var code  = t.ToUpperInvariant();
+        var found = StationData.Stations.FirstOrDefault(s => s.Code == code);
+        return found != default ? found : (code, code);
+    }
+
+    // ── Column definitions ────────────────────────────────────────────────────
+    private void BuildColumns()
+    {
+        dgvTrains.AutoGenerateColumns = false;
+        dgvTrains.Columns.AddRange(
+            TC("TrainNo",   "Train",     65),
+            TC("TrainName", "Train Name",170),
+            TC("From",      "From",      55),
+            TC("DepTime",   "Dep.",       55),
+            TC("DepDate",   "Date",       55),
+            TC("To",        "To",         55),
+            TC("ArrTime",   "Arr.",       55),
+            TC("ArrDate",   "Date",       55),
+            TC("Duration",  "Travel",     60),
+            TC("Mon", "M", 26), TC("Tue", "T", 26), TC("Wed", "W", 26),
+            TC("Thu", "T", 26), TC("Fri", "F", 26), TC("Sat", "S", 26),
+            TC("Sun", "S", 26),
+            TC("Avl1A", "1A", 70), TC("Avl2A", "2A", 70),
+            TC("Avl3A", "3A", 70), TC("AvlCC", "CC", 70),
+            TC("AvlSL", "SL", 70), TC("Avl2S", "2S", 70),
+            TC("Avl3E", "3E", 70)
+        );
+    }
+
+    private static DataGridViewTextBoxColumn TC(string prop, string hdr, int w) => new()
+    {
+        DataPropertyName = prop,
+        HeaderText       = hdr,
+        Width            = w,
+        ReadOnly         = true,
+        SortMode         = DataGridViewColumnSortMode.Automatic,
+        DefaultCellStyle = new DataGridViewCellStyle
+            { Alignment = DataGridViewContentAlignment.MiddleCenter }
+    };
+
+    // ── Cell colour formatting ────────────────────────────────────────────────
+    private void DgvTrains_CellFormatting(object? sender, DataGridViewCellFormattingEventArgs e)
+    {
+        if (e.RowIndex < 0 || dgvTrains.DataSource is not List<TrainInfo> list) return;
+        if (e.CellStyle is null) return;
+        var train = list[e.RowIndex];
+        var col   = dgvTrains.Columns[e.ColumnIndex].DataPropertyName;
+
+        switch (col)
+        {
+            case "TrainNo":
+            case "TrainName":
+                e.CellStyle.ForeColor = ParseTrainColor(train.TrainColor);
+                e.CellStyle.Font = new Font(dgvTrains.Font, FontStyle.Bold);
+                break;
+
+            case "DepDate":
+                e.CellStyle.ForeColor = train.DepSameDay ? Color.Green : Color.Red;
+                break;
+
+            case "ArrDate":
+                e.CellStyle.ForeColor = train.ArrSameDay ? Color.Green : Color.Red;
+                break;
+
+            case "Mon": case "Tue": case "Wed": case "Thu":
+            case "Fri": case "Sat": case "Sun":
+                if (e.Value?.ToString() == "Y")
+                {
+                    e.CellStyle.ForeColor = Color.Green;
+                    e.CellStyle.Font = new Font(dgvTrains.Font, FontStyle.Bold);
+                }
+                else
+                    e.CellStyle.ForeColor = Color.LightGray;
+                break;
+
+            case "Avl1A": case "Avl2A": case "Avl3A": case "AvlCC":
+            case "AvlSL": case "Avl2S": case "Avl3E":
+                var avl = e.Value?.ToString() ?? "";
+                if (avl.StartsWith("AVAIL", StringComparison.OrdinalIgnoreCase))
+                    e.CellStyle.ForeColor = Color.Green;
+                else if (avl.StartsWith("WL", StringComparison.OrdinalIgnoreCase))
+                    e.CellStyle.ForeColor = Color.DarkOrange;
+                else if (avl == "x" || avl == "")
+                    e.CellStyle.ForeColor = Color.LightGray;
+                else
+                    e.CellStyle.ForeColor = Color.DimGray;
+                break;
+        }
+    }
+
+    private static Color ParseTrainColor(string hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex)) return ColDefault;
+        try { return ColorTranslator.FromHtml(hex); }
+        catch { return ColDefault; }
+    }
+
+    // ── Search button ─────────────────────────────────────────────────────────
+    private async void btnGetTrains_Click(object? sender, EventArgs e)
+    {
+        var (fromName, fromCode) = ResolveStation(txtFrom, _fromStn);
+        var (toName,   toCode)   = ResolveStation(txtTo,   _toStn);
+
+        if (string.IsNullOrWhiteSpace(fromCode) || string.IsNullOrWhiteSpace(toCode))
+        {
+            MessageBox.Show("Enter both station codes (e.g. NDLS, BCT).",
+                "Missing Input", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        btnGetTrains.Enabled = false;
+        dgvTrains.DataSource = null;
+        lblStatus.Text       = "Searching…";
+
+        var date     = dtpDate.Value.ToString("dd-MMM-yyyy");
+        var progress = new Progress<string>(msg =>
+            { if (!IsDisposed) lblStatus.Text = msg; });
+
+        try
+        {
+            var trains = await _scraper.SearchAsync(
+                fromName, fromCode, toName, toCode, date, progress);
+            dgvTrains.DataSource = trains;
+            lblStatus.Text = trains.Count > 0
+                ? $"{trains.Count} trains found  |  {fromCode} → {toCode}  |  {date}"
+                : $"No trains found for {fromCode} → {toCode}.";
+        }
+        catch (Exception ex)
+        {
+            lblStatus.Text = "Error.";
+            MessageBox.Show(ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally { btnGetTrains.Enabled = true; }
+    }
+
+    // ── Swap button ───────────────────────────────────────────────────────────
+    private void btnSwap_Click(object? sender, EventArgs e)
+    {
+        (txtFrom.Text, txtTo.Text) = (txtTo.Text, txtFrom.Text);
+        (_fromStn,     _toStn)     = (_toStn,     _fromStn);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        _scraper.Dispose();
+        base.OnFormClosed(e);
+    }
+}

@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 15
+VisualStudioVersion = 15.0.36324.19
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "indian-ticketing", "indian-ticketing\indian-ticketing.csproj", "{E7B647AA-216E-4C6F-A5C2-F3FBF3C465A5}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{E7B647AA-216E-4C6F-A5C2-F3FBF3C465A5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E7B647AA-216E-4C6F-A5C2-F3FBF3C465A5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E7B647AA-216E-4C6F-A5C2-F3FBF3C465A5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E7B647AA-216E-4C6F-A5C2-F3FBF3C465A5}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {94641C33-E74F-4FFF-ABD4-20EAB9211D3D}
+	EndGlobalSection
+EndGlobal

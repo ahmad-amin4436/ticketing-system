@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(nuget install Microsoft.Web.WebView2 -OutputDirectory \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\packages\" -Version 1.0.2739.15)",
+      "PowerShell(dotnet --version)",
+      "PowerShell(dotnet nuget --version 2>$null)",
+      "PowerShell(dotnet add \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\\\\indian-ticketing.csproj\" package Microsoft.Web.WebView2)"
+    ]
+  }
+}
