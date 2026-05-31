@@ -29,7 +29,9 @@ partial class Form1
         txtTo        = new System.Windows.Forms.TextBox();
         dtpDate      = new System.Windows.Forms.DateTimePicker();
         cmbQuota     = new System.Windows.Forms.ComboBox();
-        cmbClass     = new System.Windows.Forms.ComboBox();
+        cmbClass      = new System.Windows.Forms.ComboBox();
+        btnSaveTrain  = new System.Windows.Forms.Button();
+        btnBookingMgr = new System.Windows.Forms.Button();
         // status + grid
         pnlStatus    = new System.Windows.Forms.Panel();
         lblStatus    = new System.Windows.Forms.Label();
@@ -49,7 +51,8 @@ partial class Form1
         {
             lblFromHdr, chkFromOnly, lblToHdr, chkToOnly,
             chkSortDate, chkFirstLast, cmbTrainType, btnGetTrains,
-            txtFrom, btnSwap, txtTo, dtpDate, cmbQuota, cmbClass
+            txtFrom, btnSwap, txtTo, dtpDate, cmbQuota, cmbClass,
+            btnSaveTrain, btnBookingMgr
         });
 
         // ── ROW 1 ────────────────────────────────────────────────────────────
@@ -111,6 +114,22 @@ partial class Form1
         btnGetTrains.Text     = "Get Trains";
         btnGetTrains.UseVisualStyleBackColor = true;
         btnGetTrains.Click   += new System.EventHandler(btnGetTrains_Click);
+
+        // "Save Train" button
+        btnSaveTrain.Font     = new System.Drawing.Font("Segoe UI", 8F);
+        btnSaveTrain.Location = new System.Drawing.Point(864, y1 - 2);
+        btnSaveTrain.Size     = new System.Drawing.Size(90, 24);
+        btnSaveTrain.Text     = "Save Train";
+        btnSaveTrain.UseVisualStyleBackColor = true;
+        btnSaveTrain.Click   += new System.EventHandler(btnSaveTrain_Click);
+
+        // "Booking Manager" button
+        btnBookingMgr.Font     = new System.Drawing.Font("Segoe UI", 8F);
+        btnBookingMgr.Location = new System.Drawing.Point(864, y1 + 26);
+        btnBookingMgr.Size     = new System.Drawing.Size(90, 24);
+        btnBookingMgr.Text     = "Booking Mgr";
+        btnBookingMgr.UseVisualStyleBackColor = true;
+        btnBookingMgr.Click   += new System.EventHandler(btnBookingMgr_Click);
 
         // ── ROW 2 ────────────────────────────────────────────────────────────
         int y2 = 38;
@@ -248,6 +267,8 @@ partial class Form1
     private System.Windows.Forms.DateTimePicker   dtpDate;
     private System.Windows.Forms.ComboBox         cmbQuota;
     private System.Windows.Forms.ComboBox         cmbClass;
+    private System.Windows.Forms.Button           btnSaveTrain;
+    private System.Windows.Forms.Button           btnBookingMgr;
     private System.Windows.Forms.Panel            pnlStatus;
     private System.Windows.Forms.Label            lblStatus;
     private System.Windows.Forms.DataGridView     dgvTrains;

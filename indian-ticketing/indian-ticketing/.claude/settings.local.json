@@ -4,7 +4,12 @@
       "PowerShell(nuget install Microsoft.Web.WebView2 -OutputDirectory \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\packages\" -Version 1.0.2739.15)",
       "PowerShell(dotnet --version)",
       "PowerShell(dotnet nuget --version 2>$null)",
-      "PowerShell(dotnet add \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\\\\indian-ticketing.csproj\" package Microsoft.Web.WebView2)"
+      "PowerShell(dotnet add \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\\\\indian-ticketing.csproj\" package Microsoft.Web.WebView2)",
+      "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Select-String \"error|Error|warning|Warning\" | Where-Object { $_ -notmatch \"0 Warning|0 Error|workload\" } | Select-Object -Last 15)",
+      "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error \" })",
+      "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error \" } | Select-Object -First 15)",
+      "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error \" }; dotnet build -c Debug 2>&1 | Select-Object -Last 3)",
+      "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error CS\" })"
     ]
   }
 }

@@ -289,6 +289,82 @@ public partial class Form1 : Form
         finally { btnGetTrains.Enabled = true; }
     }
 
+    // ── Save Train button ─────────────────────────────────────────────────────
+    private void btnSaveTrain_Click(object? sender, EventArgs e)
+    {
+        if (dgvTrains.SelectedRows.Count == 0)
+        {
+            MessageBox.Show("Select a train row first.", "No Selection",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var (fromName, fromCode) = ResolveStation(txtFrom, _fromStn);
+        var (toName,   toCode)   = ResolveStation(txtTo,   _toStn);
+        var date  = dtpDate.Value.ToString("dd-MMM-yyyy");
+        var cls   = cmbClass.SelectedItem?.ToString() ?? "SL";
+        var quota = cmbQuota.SelectedItem?.ToString() ?? "General Quota";
+
+        // Normalise class code: "SL - Sleeper" → "SL"
+        var clsCode = cls.Contains('-') ? cls.Split('-')[0].Trim() : cls;
+        // Normalise quota: "General Quota" → "GN"
+        var quotaCode = quota switch
+        {
+            var q when q.Contains("General")  => "GN",
+            var q when q.Contains("Tatkal")   => "TQ",
+            var q when q.Contains("Pre")      => "PT",
+            _                                  => "GN",
+        };
+
+        var saved = new List<SavedBooking>();
+        foreach (DataGridViewRow row in dgvTrains.SelectedRows)
+        {
+            if (dgvTrains.DataSource is not List<TrainInfo> list) break;
+            var train = list[row.Index];
+
+            var booking = new SavedBooking
+            {
+                TrainNo     = train.TrainNo,
+                TrainName   = train.TrainName,
+                FromCode    = fromCode,
+                FromName    = fromName,
+                ToCode      = toCode,
+                ToName      = toName,
+                DepTime     = train.DepTime,
+                ArrTime     = train.ArrTime,
+                Duration    = train.Duration,
+                JourneyDate = date,
+                TravelClass = clsCode,
+                Quota       = quotaCode,
+            };
+            saved.Add(booking);
+        }
+
+        if (saved.Count == 0) return;
+
+        // Ask for passengers once (applies to all selected rows)
+        using var dlg = new PassengersDialog();
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        var existing = SavedBooking.LoadAll();
+        foreach (var b in saved)
+        {
+            b.Passengers = dlg.Passengers;
+            existing.Add(b);
+        }
+        SavedBooking.SaveAll(existing);
+
+        lblStatus.Text = $"{saved.Count} train(s) saved for booking.";
+        MessageBox.Show($"{saved.Count} train(s) saved.\nOpen Booking Manager to start IRCTC automation.",
+            "Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    // ── Booking Manager button ────────────────────────────────────────────────
+    private void btnBookingMgr_Click(object? sender, EventArgs e)
+    {
+        new BookingManagerForm().Show(this);
+    }
+
     // ── Swap button ───────────────────────────────────────────────────────────
     private void btnSwap_Click(object? sender, EventArgs e)
     {
