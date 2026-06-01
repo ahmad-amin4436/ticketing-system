@@ -346,37 +346,74 @@ true;";
 
             // Gender — find the dropdown that contains Male/Female options
             var gLabel = p.Gender == "F" ? "Female" : p.Gender == "T" ? "Transgender" : "Male";
-            Report($"Step 6 — Setting gender to {gLabel}...");
+  Report($"Step 6 — Setting gender to {gLabel}...");
 
-            // Try clicking the specific gender dropdown for this passenger row
-            bool gDropClicked = await ClickAsync($@"(function(){{
-  // Gather all gender-related dropdowns on the page
+     // Step 1: Find and click the gender dropdown trigger for this passenger
+     bool gDropClicked = await ClickAsync($@"(function(){{
   var all = Array.from(document.querySelectorAll('p-dropdown, select'));
   var genderDrops = all.filter(function(d){{
     var fc = (d.getAttribute('formcontrolname')||'').toLowerCase();
     var txt = (d.innerText||'').toUpperCase();
     return fc.includes('gender') || txt.includes('MALE') || txt.includes('FEMALE');
   }});
-  return genderDrops[{i}] || null;
+  var drop = genderDrops[{i}];
+  if (!drop) return null;
+  // Find the trigger element (usually .p-dropdown-trigger or similar)
+  var trigger = drop.querySelector('.p-dropdown-trigger, .p-dropdown-label, [role=""button""], .ui-dropdown-trigger');
+  return trigger || drop;
 }})()");
-            await D(500); await InjectAsync();
+            await D(600); await InjectAsync();
 
-            // Click the matching option
-            await ClickText("li,option,span.ui-dropdown-item", gLabel);
+    // Step 2: Wait for the dropdown menu to appear and then click the option
+            bool optionFound = await WaitForAsync(@"(function(){{
+  var opts = Array.from(document.querySelectorAll(
+    'li[data-label], .p-dropdown-item, li.ui-dropdown-item, option'));
+  return opts.some(function(o){{
+    var txt = (o.innerText || o.textContent || '').trim().toUpperCase();
+    return txt.includes('{gLabel.ToUpper()}');
+  }});
+}})();", 3000);
 
-            // Fallback: if dropdown didn't open, try clicking the label
-            if (!await ExecBool($"__h.pageHas('{gLabel}')"))
-            {
-                await ClickAsync($@"(function(){{
+   if (optionFound)
+          {
+          // Click the matching option
+     await ClickText("li,option", gLabel);
+       await D(800); // Wait for dropdown to close and selection to register
+   }
+     else
+   {
+    // Fallback: Try direct value setting on select or p-dropdown
+    Report($"Step 6 — Gender dropdown fallback for {gLabel}...");
+         await Exec($@"(function(){{
   var all = Array.from(document.querySelectorAll('p-dropdown, select'));
   var gDrops = all.filter(function(d){{
-    return (d.getAttribute('formcontrolname')||'').toLowerCase().includes('gender')
+  return (d.getAttribute('formcontrolname')||'').toLowerCase().includes('gender')
         || (d.innerText||'').toUpperCase().includes('MALE');
   }});
-  return gDrops[{i}] || null;
-}})()");
-                await D(400); await InjectAsync();
-                await ClickText("li,option", gLabel);
+  var drop = gDrops[{i}];
+  if (!drop) return;
+  
+  // If it's a native select
+  if (drop.tagName === 'SELECT') {{
+    var opt = Array.from(drop.options).find(function(o){{
+      return (o.textContent||'').trim().toUpperCase().includes('{gLabel.ToUpper()}');
+    }});
+    if (opt) {{
+      drop.value = opt.value;
+      drop.dispatchEvent(new Event('change', {{bubbles: true}}));
+    }}
+    return;
+  }}
+  
+  // If it's a p-dropdown, click it first to open
+  var trigger = drop.querySelector('.p-dropdown-trigger, .p-dropdown-label, [role=""button""]');
+  if (trigger) trigger.click();
+}})();");
+     await D(800); await InjectAsync();
+
+        // Now click the option that appears
+  await ClickText("li", gLabel);
+     await D(800);
             }
             await D(400);
         }
@@ -384,9 +421,38 @@ true;";
         // Berth preference (optional — scroll to find it)
         await D(500);
 
-        Report("Step 6 — Clicking Continue Booking...");
-        await ClickText("button,a", "Continue Booking");
+        bool paymentModeReady = await WaitForAsync(
+            @"__h.exists('input[name=""paymentType""][value=""2""]') || __h.pageHas('Pay through BHIM/UPI')",
+            5000);
+        if (paymentModeReady)
+        {
+            bool upiSelected = await SelectBhimUpiPaymentAsync("Step 6");
+            if (!upiSelected)
+            {
+                Report("Step 6 - Could not auto-select BHIM/UPI. Please click the BHIM/UPI radio button manually, then click 'OK (Continue)'.");
+                await UserAckAsync();
+                await InjectAsync();
+            }
+            await D(500);
+        }
+
+        Report("Step 6 - Clicking Continue...");
+        bool contClicked = await ClickPassengerContinueAsync();
+        if (!contClicked)
+        {
+            Report("Step 6 - Continue button not found. Click Continue manually, then 'OK (Continue)'.");
+            await UserAckAsync();
+            await InjectAsync();
+        }
         await D(3000); await InjectAsync();
+        
+        // Wait for page to transition to next step before proceeding
+        Report("Step 6 — Waiting for page to load next step...");
+        await WaitForAsync(
+            "__h.pageHas('Payment') || __h.pageHas('payment') || __h.pageHas('UPI') || " +
+            "__h.pageHas('Review') || __h.pageHas('review') || __h.pageHas('Confirmation')",
+          8000);
+        await D(2000); await InjectAsync();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -394,62 +460,235 @@ true;";
     // ═══════════════════════════════════════════════════════════════════════
     private async Task Step7_SelectUpiAsync()
     {
-        Report("Step 7 — Waiting for payment options...");
-        bool payPage = await WaitForAsync(
-            "__h.pageHas('UPI') || __h.pageHas('BHIM') || __h.pageHas('Payment') || __h.pageHas('payment')",
-            10000);
+        Report("Step 7 - Checking whether payment mode still needs selection...");
+        await D(1000);
+        await InjectAsync();
 
-        if (!payPage)
+        bool hasPaymentOptions = await WaitForAsync(
+            @"__h.exists('input[name=""paymentType""][value=""2""]') || __h.pageHas('Pay through BHIM/UPI')",
+            4000);
+        if (!hasPaymentOptions)
         {
-            Report("Payment page not detected — please navigate to payment, then 'OK (Continue)'.");
-            await UserAckAsync(); await InjectAsync();
+            Report("Step 7 - Payment mode was already handled on the passenger details page.");
+            return;
         }
-        await D(1000); await InjectAsync();
 
-        // Click UPI radio button — try multiple selectors
-        Report("Step 7 — Selecting BHIM/UPI payment...");
-
-        // Find the radio button associated with UPI/BHIM label
-        bool upiSelected = await ClickAsync(@"(function(){
-  // Try radio inputs by value or id containing 'upi'/'bhim'
-  var radios = Array.from(document.querySelectorAll('input[type=""radio""]'));
-  var upi = radios.find(function(r){
-    var v=(r.value||r.id||'').toLowerCase();
-    if(v.includes('upi')||v.includes('bhim')) return true;
-    // Check associated label
-    var lbl = document.querySelector('label[for=""'+r.id+'""],[for=""'+r.name+'""')
-           || r.closest('label');
-    return lbl && (lbl.innerText||'').toUpperCase().includes('UPI');
-  });
-  return upi || null;
-})()");
-
+        bool upiSelected = await SelectBhimUpiPaymentAsync("Step 7");
         if (!upiSelected)
         {
-            // Fallback: click any label/span/div containing UPI or BHIM text
-            upiSelected = await ClickText("label,div,span", "UPI");
-            if (!upiSelected) await ClickText("label,div,span", "BHIM");
+            Report("Step 7 - Could not auto-select BHIM/UPI. Please click the BHIM/UPI radio button manually, then click 'OK (Continue)'.");
+            await UserAckAsync();
+            await InjectAsync();
         }
 
-        await D(800); await InjectAsync();
+        await D(800);
+        await InjectAsync();
 
-        Report("Step 7 — Clicking Continue...");
-        await ClickText("button", "CONTINUE");
-        await D(3000); await InjectAsync();
+        Report("Step 7 - Clicking Continue button...");
+        bool contClicked = await ClickPassengerContinueAsync();
+        if (!contClicked)
+        {
+            Report("Step 7 - Continue button not found. Click Continue manually, then 'OK (Continue)'.");
+            await UserAckAsync();
+            await InjectAsync();
+        }
+
+        await D(3000);
+        await InjectAsync();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP 8 — Review page: CAPTCHA must be solved before proceeding
     // ═══════════════════════════════════════════════════════════════════════
+    private async Task<bool> SelectBhimUpiPaymentAsync(string stepName)
+    {
+        Report($"{stepName} - Selecting BHIM/UPI payment mode...");
+        await InjectAsync();
+
+        bool selected = await ExecBool(@"(function(){
+  function event(el, name) {
+    if (!el) return;
+    el.dispatchEvent(new Event(name, {bubbles:true, cancelable:true, composed:true}));
+  }
+  function mouse(el, name) {
+    if (!el) return;
+    el.dispatchEvent(new MouseEvent(name, {bubbles:true, cancelable:true, composed:true, view:window}));
+  }
+
+  var input = document.querySelector('input[name=""paymentType""][value=""2""]');
+  if (!input) {
+    input = Array.from(document.querySelectorAll('input[type=""radio""]')).find(function(r) {
+      var root = r.closest('label,tr,div') || r;
+      var text = (root.innerText || root.textContent || '').toUpperCase();
+      return text.includes('PAY THROUGH BHIM/UPI') || (text.includes('BHIM') && text.includes('UPI'));
+    });
+  }
+
+  var widget = input ? input.closest('p-radiobutton') : null;
+  var root = widget ? widget.closest('label,tr') : (input ? input.closest('label,tr,div') : null);
+
+  if (!root) {
+    root = Array.from(document.querySelectorAll('label,tr,div,span'))
+      .filter(function(el) {
+        var text = (el.innerText || el.textContent || '').toUpperCase();
+        return text.includes('PAY THROUGH BHIM/UPI') || (text.includes('BHIM') && text.includes('UPI'));
+      })
+      .sort(function(a, b) {
+        return (a.innerText || a.textContent || '').length - (b.innerText || b.textContent || '').length;
+      })[0];
+  }
+
+  if (!root) return null;
+  var box = root.querySelector('.ui-radiobutton-box,[role=""radio""]');
+  var target = box || widget || input || root;
+
+  try { target.scrollIntoView({block:'center', inline:'nearest'}); } catch(e) {}
+
+  if (input) {
+    try {
+      var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;
+      setter.call(input, true);
+    } catch(e) {
+      input.checked = true;
+    }
+    input.setAttribute('checked', 'checked');
+  }
+
+  mouse(target, 'pointerdown');
+  mouse(target, 'mousedown');
+  mouse(target, 'mouseup');
+  if (target.click) target.click();
+
+  if (input) {
+    if (input.click) input.click();
+    event(input, 'input');
+    event(input, 'change');
+    event(input, 'blur');
+  }
+
+  if (box) {
+    box.classList.add('ui-state-active');
+    box.setAttribute('aria-checked', 'true');
+  }
+
+  return !!(input || target);
+})()");
+
+        if (!selected)
+        {
+            selected = await ClickAsync(@"(function(){
+  var input = document.querySelector('input[name=""paymentType""][value=""2""]');
+  var widget = input ? input.closest('p-radiobutton') : null;
+  var root = widget ? widget.closest('label,tr') : null;
+  return root ? (root.querySelector('.ui-radiobutton-box,[role=""radio""]') || root) : null;
+})()");
+        }
+
+        if (!selected) return false;
+
+        await D(800);
+        await InjectAsync();
+        return await ExecBool(@"(function(){
+  var input = document.querySelector('input[name=""paymentType""][value=""2""]');
+  if (input && input.checked) return true;
+  var root = input ? input.closest('label,tr') : null;
+  if (!root) return false;
+  var box = root.querySelector('.ui-radiobutton-box,[role=""radio""]');
+  return !!(box && (box.classList.contains('ui-state-active') || box.getAttribute('aria-checked') === 'true'));
+})()") || selected;
+    }
+
+    private async Task<bool> ClickPassengerContinueAsync()
+    {
+        await InjectAsync();
+
+        bool domClicked = await ExecBool(@"(function(){
+  function usable(el) {
+    if (!el || el.disabled) return false;
+    var text = (el.innerText || el.textContent || '').toUpperCase().trim();
+    if (!text.includes('CONTINUE') || text.includes('BOOKING')) return false;
+    var style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    var rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+  function fire(el, name) {
+    el.dispatchEvent(new MouseEvent(name, {bubbles:true, cancelable:true, composed:true, view:window}));
+  }
+
+  var all = Array.from(document.querySelectorAll('button,input[type=""submit""],a,[role=""button""],span,div'));
+  var candidates = all.filter(usable).sort(function(a, b) {
+    var ar = a.getBoundingClientRect();
+    var br = b.getBoundingClientRect();
+    var as = ((a.className || '') + ' ' + (a.type || '')).toLowerCase();
+    var bs = ((b.className || '') + ' ' + (b.type || '')).toLowerCase();
+    var aw = (as.includes('mob-bot-btn') || as.includes('search_btn') || as.includes('train_search') || as.includes('btndefault') || a.type === 'submit') ? 10000 : 0;
+    var bw = (bs.includes('mob-bot-btn') || bs.includes('search_btn') || bs.includes('train_search') || bs.includes('btndefault') || b.type === 'submit') ? 10000 : 0;
+    return (bw + br.bottom) - (aw + ar.bottom);
+  });
+
+  var target = candidates[0];
+  if (!target) {
+    target = Array.from(document.querySelectorAll('button[type=""submit""],input[type=""submit""]'))
+      .filter(function(el) { return !el.disabled; })
+      .sort(function(a, b) { return b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom; })[0];
+  }
+  if (!target) return false;
+
+  var button = target.closest('button,a,[role=""button""]') || target;
+  try { button.scrollIntoView({block:'center', inline:'nearest'}); } catch(e) {}
+  fire(button, 'pointerdown');
+  fire(button, 'mousedown');
+  fire(button, 'mouseup');
+  if (button.click) button.click();
+
+  var form = button.closest('form') || document.querySelector('app-passenger-input form, form');
+  if (form && button.tagName === 'BUTTON' && button.type === 'submit') {
+    try { form.requestSubmit(button); }
+    catch(e) { form.dispatchEvent(new Event('submit', {bubbles:true, cancelable:true})); }
+  }
+  return true;
+})()");
+
+        if (domClicked) return true;
+
+        return await ClickAsync(@"(function(){
+  var buttons = Array.from(document.querySelectorAll('button,input[type=""submit""],a,[role=""button""]'));
+  return buttons.filter(function(b) {
+    var text = (b.innerText || b.textContent || b.value || '').toUpperCase().trim();
+    return text.includes('CONTINUE') && !text.includes('BOOKING') && !b.disabled;
+  }).sort(function(a, b) {
+    return b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom;
+  })[0] || null;
+})()");
+    }
+
     private async Task Step8_ReviewAndCaptchaAsync()
     {
-        Report("Step 8 — Waiting for review / captcha page...");
-        await D(2000); await InjectAsync();
+        Report("Step 8 - Waiting for review / captcha page...");
+        bool reviewReady = await WaitForAsync(
+            @"__h.pageHas('Review Journey') || " +
+            @"__h.pageHas('Journey Details') || " +
+            @"__h.pageHas('Booking Details') || " +
+            @"__h.pageHas('Total Fare') || " +
+            @"__h.exists('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""],input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""]') || " +
+            @"__h.pageHas('Captcha')",
+            30000);
+
+        if (!reviewReady)
+        {
+            Report("Step 8 - Review page did not appear yet. Waiting for user confirmation to continue.");
+            await UserAckAsync();
+        }
+
+        await D(1000); await InjectAsync();
 
         // Wait for captcha image to appear (up to 15 s)
         bool hasCaptcha = await WaitForAsync(
-            @"__h.exists('img[src*=""captcha""]') || " +
+            @"__h.exists('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""]') || " +
             @"__h.exists('input[id*=""captcha""]') || " +
+            @"__h.exists('input[name*=""captcha""]') || " +
+            @"__h.exists('input[formcontrolname*=""captcha""]') || " +
             @"__h.exists('input[placeholder*=""Captcha""]') || " +
             @"__h.pageHas('Enter Captcha') || " +
             @"__h.pageHas('Captcha')",
@@ -457,28 +696,28 @@ true;";
 
         if (hasCaptcha)
         {
-            // Scroll captcha into view so the user can see it clearly
             await Exec(@"(function(){
-  var img = document.querySelector('img[src*=""captcha""]');
-  if(img) img.scrollIntoView({block:'center'});
+  var el = document.querySelector('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""],input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""]');
+  if(el) el.scrollIntoView({block:'center'});
 })();");
 
-            Report("Step 8 — CAPTCHA visible. Type the answer in the browser, then click 'OK (Continue)'.");
-            await UserAckAsync();          // wait for user to solve + click OK
-            await D(500); await InjectAsync();
+            Report("Step 8 - CAPTCHA visible. Solving automatically...");
+            await AutoSolveCaptchaAsync();
+            await D(800); await InjectAsync();
         }
         else
         {
-            Report("Step 8 — No captcha detected. Proceeding...");
+            Report("Step 8 - No captcha detected. Proceeding...");
         }
 
         // Click Continue (after captcha is solved)
-        Report("Step 8 — Clicking Continue...");
-        bool cont = await ClickText("button", "CONTINUE");
-        if (!cont) cont = await ClickText("button", "Continue");
+        Report("Step 8 - Clicking Continue...");
+        bool cont = await ClickPassengerContinueAsync();
+        if (!cont) cont = await ClickText("button,a", "CONTINUE");
+        if (!cont) cont = await ClickText("button,a", "Continue");
         if (!cont)
         {
-            Report("Step 8 — Continue not found — click it manually, then 'OK (Continue)'.");
+            Report("Step 8 - Continue not found - click it manually, then 'OK (Continue)'.");
             await UserAckAsync(); await InjectAsync();
         }
         await D(3000); await InjectAsync();
@@ -494,16 +733,17 @@ true;";
 
         // One more captcha check — some IRCTC flows show it right before Pay & Book
         bool lateCaptcha = await WaitForAsync(
-            @"__h.exists('img[src*=""captcha""]') || __h.exists('input[placeholder*=""Captcha""]')",
+            @"__h.exists('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""]') || " +
+            @"__h.exists('input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""]')",
             4000);
         if (lateCaptcha)
         {
             await Exec(@"(function(){
-  var img = document.querySelector('img[src*=""captcha""]');
-  if(img) img.scrollIntoView({block:'center'});
+  var el = document.querySelector('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""],input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""]');
+  if(el) el.scrollIntoView({block:'center'});
 })();");
-            Report("Step 9 — CAPTCHA on payment page. Solve it, then click 'OK (Continue)'.");
-            await UserAckAsync();
+            Report("Step 9 - CAPTCHA on payment page. Solving automatically...");
+            await AutoSolveCaptchaAsync();
             await D(500); await InjectAsync();
         }
 
@@ -711,7 +951,9 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
 
             // Check captcha is actually visible
             bool visible = await ExecBool(
-                @"__h.exists('img[src*=""captcha""]') || __h.exists('input[placeholder*=""Captcha""]')");
+                @"__h.exists('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""],canvas') || " +
+                @"__h.exists('input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""],input[placeholder*=""captcha""]') || " +
+                @"__h.pageHas('Captcha')");
             if (!visible) return; // no captcha on this page
 
             Report($"Auto-solving CAPTCHA (attempt {attempt}/{maxAttempts})...");
@@ -730,12 +972,13 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
             // Enter the captcha text
             await Exec($@"(function(){{
   var inp = document.querySelector(
-    'input[id*=""captcha""],input[placeholder*=""Captcha""],input[placeholder*=""captcha""]');
+    'input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""],input[placeholder*=""captcha""]');
   if (!inp) return;
   var s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
   s.call(inp, '{Esc(text)}');
   inp.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
   inp.dispatchEvent(new Event('change',{{bubbles:true}}));
+  inp.dispatchEvent(new FocusEvent('blur',{{bubbles:true}}));
 }})();");
             await D(400);
 
@@ -766,8 +1009,16 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
         {
             // ── 1. Get captcha image bytes ────────────────────────────────
             var src = (await Exec(@"(function(){
-  var img = document.querySelector('img[src*=""captcha""],img[id*=""captcha""]');
-  return img ? img.src : '';
+  var img = document.querySelector('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""]')
+    || Array.from(document.images).find(function(i) {
+      var text = ((i.id || '') + ' ' + (i.alt || '') + ' ' + (i.className || '') + ' ' + (i.src || '')).toLowerCase();
+      var r = i.getBoundingClientRect();
+      return (text.includes('captcha') || (r.width >= 80 && r.width <= 400 && r.height >= 25 && r.height <= 150))
+        && r.width > 0 && r.height > 0;
+    });
+  if (img) return img.src;
+  var canvas = document.querySelector('canvas');
+  return canvas ? canvas.toDataURL() : '';
 })()")).Trim('"');
             if (string.IsNullOrEmpty(src)) return "";
 
@@ -848,9 +1099,9 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
     {
         // Click captcha image or a refresh icon to get a new one
         await Exec(@"(function(){
-  var img = document.querySelector('img[src*=""captcha""]');
+  var img = document.querySelector('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""]');
   if (img) img.click();
-  var ref2 = document.querySelector('[class*=""refresh""],[id*=""refresh""]');
+  var ref2 = document.querySelector('[class*=""refresh""],[id*=""refresh""],[title*=""refresh""],[aria-label*=""refresh""]');
   if (ref2) ref2.click();
 })();");
     }
