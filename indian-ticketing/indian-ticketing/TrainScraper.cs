@@ -1,9 +1,4 @@
-using HtmlAgilityPack;
-using HtmlDocument = HtmlAgilityPack.HtmlDocument;
-using OpenQA.Selenium;
-using OpenQA.Selenium.Chrome;
-using OpenQA.Selenium.Support.UI;
-using System.Net;
+using System.Globalization;
 
 namespace indian_ticketing;
 
@@ -40,191 +35,171 @@ public class TrainInfo
     public bool   ArrSameDay   { get; set; } = true;
 }
 
+// Fast, browser-free scraper. erail.in exposes the same data its own page loads
+// via a lightweight text endpoint (getTrains.aspx) that returns all trains for a
+// route as a single ~/^-delimited blob. We hit it directly with HttpClient — no
+// Selenium, no Chrome, no AJAX waits — so a search completes in a few hundred ms.
+//
+// NB: live per-class seat availability (AVAILABLE-12 / WL 45) is NOT in this feed;
+// erail loads it lazily per train via separate calls. We show which classes run
+// instead. The TrainScraper public surface (SearchAsync / Dispose) is unchanged.
 public class TrainScraper : IDisposable
 {
-    private ChromeDriver? _driver;
-    private bool _disposed;
+    private static readonly HttpClient Http = CreateClient();
 
-    // ── public API ───────────────────────────────────────────────────────────
+    private static HttpClient CreateClient()
+    {
+        var c = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+        c.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+        c.DefaultRequestHeaders.Referrer = new Uri("https://erail.in/");
+        return c;
+    }
+
+    // erail.in class-bitmap positions (the 15-char field). Maps each UI column to
+    // its index in the bitmap. Verified against Rajdhani (1A/2A/3A), Garib Rath (3A),
+    // and Shatabdi/Vande Bharat (CC).
+    private const int Bit1A = 0, Bit2A = 1, Bit3A = 2, BitCC = 3,
+                      Bit3E = 4, BitSL = 5, Bit2S = 7;
+
+    // ── public API (unchanged signature) ────────────────────────────────────
     public async Task<List<TrainInfo>> SearchAsync(
         string fromName, string fromCode,
         string toName, string toCode,
         string date, IProgress<string>? progress = null)
     {
-        var fromSlug = StationData.ToSlug(fromName, fromCode);
-        var toSlug   = StationData.ToSlug(toName,   toCode);
-        return await Task.Run(() => Search(fromSlug, toSlug, fromCode, toCode, date, progress));
-    }
+        progress?.Report($"Querying erail.in for {fromCode} → {toCode}…");
 
-    // ── private implementation ───────────────────────────────────────────────
-    private List<TrainInfo> Search(
-        string fromSlug, string toSlug,
-        string fromCode, string toCode,
-        string date, IProgress<string>? progress)
-    {
-        if (_driver == null)
-        {
-            progress?.Report("Starting browser…");
-            var opts = new ChromeOptions();
-            opts.AddArgument("--headless=new");
-            opts.AddArgument("--no-sandbox");
-            opts.AddArgument("--disable-dev-shm-usage");
-            opts.AddArgument("--disable-gpu");
-            opts.AddArgument("--disable-software-rasterizer");
-            opts.AddArgument("--disable-background-networking");
-            opts.AddArgument("--disable-extensions");
-            opts.AddArgument("--no-first-run");
-            opts.AddArgument("--window-size=1920,1080");
-            opts.AddArgument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-            var svc = ChromeDriverService.CreateDefaultService();
-            svc.HideCommandPromptWindow = true;
-            _driver = new ChromeDriver(svc, opts);
-            _driver.Manage().Timeouts().PageLoad = TimeSpan.FromSeconds(60);
-        }
+        var url = "https://erail.in/rail/getTrains.aspx" +
+                  $"?Station_From={Uri.EscapeDataString(fromCode)}" +
+                  $"&Station_To={Uri.EscapeDataString(toCode)}" +
+                  "&DataSource=0&Language=0&Cache=true";
 
-        progress?.Report($"Loading erail.in for {fromCode} → {toCode}…");
-
-        // Clean erail.in URL: trains-between-stations/{fromSlug}/{toSlug}
-        var url = $"https://erail.in/trains-between-stations/{fromSlug}/{toSlug}";
-
-        if (!string.IsNullOrWhiteSpace(date))
-            url += $"?Date={Uri.EscapeDataString(date)}";
-
-        _driver.Navigate().GoToUrl(url);
-
-        progress?.Report("Waiting for train rows to render…");
-
-        // Wait using Selenium FindElements (C#-side, no JS injection risk)
-        var wait = new WebDriverWait(_driver, TimeSpan.FromSeconds(30));
+        string raw;
         try
         {
-            wait.Until(d => d.FindElements(By.CssSelector("tr[data-id]")).Count > 0);
+            raw = await Http.GetStringAsync(url);
         }
-        catch (WebDriverTimeoutException)
+        catch (Exception ex)
         {
-            progress?.Report("Page load slow — parsing whatever loaded…");
+            throw new Exception($"Could not reach erail.in: {ex.Message}", ex);
         }
 
-        // Extra pause so any late AJAX finishes
-        Thread.Sleep(2000);
-
-        progress?.Report("Parsing HTML…");
-
-        // ── KEY FIX: use driver.PageSource (C#) + HtmlAgilityPack ────────────
-        // Never inject JS for data extraction — large erail.in pages cause 60s timeout.
-        var html = _driver.PageSource;
-
-        var doc = new HtmlDocument();
-        doc.LoadHtml(html);
-
-        return ParseTrains(doc);
+        progress?.Report("Parsing results…");
+        var trains = ParseTrains(raw);
+        progress?.Report($"{trains.Count} trains.");
+        return trains;
     }
 
-    // ── HTML parsing (HtmlAgilityPack) ───────────────────────────────────────
-    private static List<TrainInfo> ParseTrains(HtmlDocument doc)
+    // ── parsing ───────────────────────────────────────────────────────────────
+    // Response shape: "<header>^<train1>^<train2>^…", each train a ~-delimited
+    // record. Field indices below were decoded from the live feed.
+    private static List<TrainInfo> ParseTrains(string raw)
     {
         var trains = new List<TrainInfo>();
+        if (string.IsNullOrWhiteSpace(raw)) return trains;
 
-        // Only rows with data-id are actual train rows (not headers or separators)
-        var rows = doc.DocumentNode.SelectNodes("//tr[@data-id]");
-        if (rows == null) return trains;
-
-        foreach (var row in rows)
+        var records = raw.Split('^');
+        foreach (var rec in records)
         {
-            var cells = row.SelectNodes("td");
-            if (cells == null || cells.Count < 9) continue;
+            if (string.IsNullOrWhiteSpace(rec)) continue;
+            var f = rec.Split('~');
+            if (f.Length < 22) continue;          // header / malformed row
 
-            static string Cell(HtmlNode td)
-                => WebUtility.HtmlDecode(td.InnerText).Replace("\r", "").Replace("\n", " ")
-                             .Replace("&nbsp;", " ").Trim();
+            var trainNo = f[0].Trim();
+            if (trainNo.Length == 0 || !trainNo.Any(char.IsDigit)) continue;
 
-            static string LinkText(HtmlNode td)
-            {
-                var a = td.SelectSingleNode(".//a");
-                return a != null
-                    ? WebUtility.HtmlDecode(a.InnerText).Trim()
-                    : Cell(td);
-            }
-
-            static string CellStyle(HtmlNode td)
-                => td.GetAttributeValue("style", "");
-
-            static string LinkStyle(HtmlNode td)
-                => td.SelectSingleNode(".//a")?.GetAttributeValue("style", "") ?? "";
-
-            // day cell: "Y" or "x"
-            static string Day(HtmlNode td)
-                => td.InnerText.Trim() == "Y" ? "Y" : "x";
-
-            // availability cell: text of inner <a> if present, else cell text
-            static string Avl(HtmlNode td)
-            {
-                var a = td.SelectSingleNode(".//a");
-                var v = a != null
-                    ? WebUtility.HtmlDecode(a.InnerText).Trim()
-                    : Cell(td);
-                return v == "" || v == " " ? "x" : v;
-            }
+            var days   = f[13].Trim();            // 7-char Mon..Sun bitmap
+            var cls    = f[21].Trim();            // 15-char class bitmap
 
             var t = new TrainInfo
             {
-                TrainNo   = LinkText(cells[0]),
-                TrainName = LinkText(cells[1]),
-                From      = LinkText(cells[2]),
-                DepTime   = Cell(cells[3]),
-                DepDate   = Cell(cells[4]),
-                To        = LinkText(cells[5]),
-                ArrTime   = Cell(cells[6]),
-                ArrDate   = Cell(cells[7]),
-                Duration  = LinkText(cells[8]),
+                TrainNo   = trainNo,
+                TrainName = f[1].Trim(),
+                From      = f[7].Trim(),          // boarding station code
+                DepTime   = f[10].Trim(),
+                To        = f[9].Trim(),          // alighting station code
+                ArrTime   = f[11].Trim(),
+                Duration  = f[12].Trim(),
 
-                Mon = cells.Count > 10 ? Day(cells[10]) : "",
-                Tue = cells.Count > 11 ? Day(cells[11]) : "",
-                Wed = cells.Count > 12 ? Day(cells[12]) : "",
-                Thu = cells.Count > 13 ? Day(cells[13]) : "",
-                Fri = cells.Count > 14 ? Day(cells[14]) : "",
-                Sat = cells.Count > 15 ? Day(cells[15]) : "",
-                Sun = cells.Count > 16 ? Day(cells[16]) : "",
+                Mon = DayFlag(days, 0),
+                Tue = DayFlag(days, 1),
+                Wed = DayFlag(days, 2),
+                Thu = DayFlag(days, 3),
+                Fri = DayFlag(days, 4),
+                Sat = DayFlag(days, 5),
+                Sun = DayFlag(days, 6),
 
-                Avl1A = cells.Count > 17 ? Avl(cells[17]) : "",
-                Avl2A = cells.Count > 18 ? Avl(cells[18]) : "",
-                Avl3A = cells.Count > 19 ? Avl(cells[19]) : "",
-                AvlCC = cells.Count > 20 ? Avl(cells[20]) : "",
-                AvlSL = cells.Count > 21 ? Avl(cells[21]) : "",
-                Avl2S = cells.Count > 22 ? Avl(cells[22]) : "",
-                Avl3E = cells.Count > 23 ? Avl(cells[23]) : "",
+                // We can't show live seats from this feed, so each cell shows the
+                // class code when the train offers it, or "x" when it doesn't.
+                Avl1A = ClassChip(cls, Bit1A, "1A"),
+                Avl2A = ClassChip(cls, Bit2A, "2A"),
+                Avl3A = ClassChip(cls, Bit3A, "3A"),
+                AvlCC = ClassChip(cls, BitCC, "CC"),
+                AvlSL = ClassChip(cls, BitSL, "SL"),
+                Avl2S = ClassChip(cls, Bit2S, "2S"),
+                Avl3E = ClassChip(cls, Bit3E, "3E"),
 
-                // Colour for the train number cell (matches erail.in)
-                TrainColor = ExtractColor(LinkStyle(cells[0])),
-
-                // Green = same day, Red = next day
-                DepSameDay = CellStyle(cells[4]).Contains("green"),
-                ArrSameDay = CellStyle(cells[7]).Contains("green"),
+                TrainColor = TrainTypeColor(f),
             };
 
-            if (!string.IsNullOrWhiteSpace(t.TrainNo) && t.TrainNo.Any(char.IsDigit))
-                trains.Add(t);
+            // Day fields: arr-date can roll over midnight. The feed gives times but
+            // not explicit per-row calendar dates for the searched journey, so derive
+            // the "next day" flag from whether arrival time is earlier than departure.
+            (t.DepDate, t.ArrDate, t.DepSameDay, t.ArrSameDay) =
+                DeriveDates(t.DepTime, t.ArrTime);
+
+            trains.Add(t);
         }
 
         return trains;
     }
 
-    private static string ExtractColor(string style)
+    private static string DayFlag(string bitmap, int idx)
+        => idx < bitmap.Length && bitmap[idx] == '1' ? "Y" : "x";
+
+    private static string ClassChip(string bitmap, int idx, string code)
+        => idx < bitmap.Length && bitmap[idx] == '1' ? code : "x";
+
+    // erail colours train numbers by type. Field 15 carries the type label
+    // ("Rajdhani", "Super Fast", "Garib Rath", …). Map it to the same palette
+    // Form1 uses so the grid keeps its colour cues.
+    private static string TrainTypeColor(string[] f)
     {
-        // style="color:#D56A00" → "#D56A00"
-        var idx = style.IndexOf("color:", StringComparison.OrdinalIgnoreCase);
-        if (idx < 0) return "";
-        var rest = style[(idx + 6)..].Trim().TrimEnd(';').Trim();
-        return rest.Split(' ')[0];
+        var type = f.Length > 15 ? f[15].Trim() : "";
+        return type.ToLowerInvariant() switch
+        {
+            var s when s.Contains("rajdhani")   => "#FF480B",
+            var s when s.Contains("garib")      => "#008000",
+            var s when s.Contains("super")      => "#D56A00",
+            var s when s.Contains("mail")       => "#8B4513",
+            var s when s.Contains("express")    => "#8B4513",
+            _                                    => "",
+        };
     }
+
+    // Times are "HH.mm". If arrival is at/after departure it's same-day; if it
+    // wraps past midnight the journey lands on a later day.
+    private static (string dep, string arr, bool depSame, bool arrSame)
+        DeriveDates(string depTime, string arrTime)
+    {
+        if (TryTime(depTime, out var dep) && TryTime(arrTime, out var arr))
+        {
+            bool arrSame = arr >= dep;
+            return ("", "", true, arrSame);
+        }
+        return ("", "", true, true);
+    }
+
+    private static bool TryTime(string s, out TimeSpan ts)
+        => TimeSpan.TryParseExact(s.Replace('.', ':'), @"h\:mm",
+               CultureInfo.InvariantCulture, out ts)
+           || TimeSpan.TryParseExact(s.Replace('.', ':'), @"hh\:mm",
+               CultureInfo.InvariantCulture, out ts);
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _driver?.Quit();
-        _driver?.Dispose();
-        _driver = null;
-        _disposed = true;
+        // HttpClient is shared & static; nothing per-instance to release.
     }
 }

@@ -24,10 +24,14 @@ public class BookingManagerForm : Form
     private readonly List<BookingCard> _cards   = new();
     private IrctcWebViewSession?       _session;
 
+    // One reusable QR popup window per booking — a refreshed QR replaces the
+    // image in the existing window instead of opening a new one.
+    private readonly Dictionary<SavedBooking, QrPopupForm> _qrPopups = new();
+
     public BookingManagerForm()
     {
         BuildUi();
-        _txtUser.Text = "bablusc786";
+        _txtUser.Text = "SEJAL108";
         _txtPass.Text = "Radharani@1719";
         Shown += (_, _) => _split.SplitterDistance = 320;  // layout complete here
         Load  += async (_, _) =>
@@ -141,6 +145,26 @@ public class BookingManagerForm : Form
         };
     }
 
+    // Show the captured UPI QR in its own always-on-top window (reused per booking).
+    private void ShowQrPopup(SavedBooking b, System.Drawing.Bitmap bmp)
+    {
+        if (!_qrPopups.TryGetValue(b, out var popup) || popup.IsDisposed)
+        {
+            popup = new QrPopupForm($"[{b.TrainNo}] {b.TrainName}");
+            popup.FormClosed += (_, _) => _qrPopups.Remove(b);
+            _qrPopups[b] = popup;
+        }
+        popup.SetQr(bmp);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        foreach (var popup in _qrPopups.Values.ToList())
+            if (!popup.IsDisposed) popup.Close();
+        _qrPopups.Clear();
+        base.OnFormClosed(e);
+    }
+
     // ── Booking logic ─────────────────────────────────────────────────────
     private async void StartBooking(SavedBooking booking, BookingCard card)
     {
@@ -156,7 +180,7 @@ public class BookingManagerForm : Form
         card.SetBooking(true);
         _session = new IrctcWebViewSession(_webView);
         _session.OnStatus  += msg => this.Invoke(() => card.SetStatus(msg));
-        _session.OnQrReady += bmp => this.Invoke(() => card.ShowQr(bmp));
+        _session.OnQrReady += bmp => this.Invoke(() => { card.ShowQr(bmp); ShowQrPopup(booking, bmp); });
 
         await _session.RunAsync(booking, u, p);
         card.SetBooking(false);
@@ -180,7 +204,7 @@ public class BookingManagerForm : Form
         c.SetBooking(true);
         _session = new IrctcWebViewSession(_webView);
         _session.OnStatus  += msg => this.Invoke(() => c.SetStatus(msg));
-        _session.OnQrReady += bmp => this.Invoke(() => c.ShowQr(bmp));
+        _session.OnQrReady += bmp => this.Invoke(() => { c.ShowQr(bmp); ShowQrPopup(b, bmp); });
 
         await _session.RunAsync(b, u, p);
         c.SetBooking(false);

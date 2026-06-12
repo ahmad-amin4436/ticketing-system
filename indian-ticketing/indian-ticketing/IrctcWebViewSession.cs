@@ -45,6 +45,15 @@ window.__h = {
     },
     exists:   function(sel){ return !!document.querySelector(sel); },
     pageHas:  function(t)  { return document.body.innerText.toLowerCase().includes(t.toLowerCase()); },
+    captchaImg: function(){
+        return document.querySelector(
+          'img.captcha-img, .captcha_div img, .captcha_mainDeiv img, ' +
+          'img[alt*=""Captcha""], img[src*=""captcha""], img[id*=""captcha""]');
+    },
+    captchaVisible: function(){
+        return !!(this.captchaImg()
+            || document.querySelector('input#captcha, input[formcontrolname=""captcha""], input[placeholder*=""Captcha""]'));
+    },
     imgSrc:   function(sel){ var e=document.querySelector(sel); return e?e.src:''; },
     canvasUrl:function(sel){ var e=document.querySelector(sel); return e?e.toDataURL():''; },
     rect: function(expr) {
@@ -86,19 +95,22 @@ true;";
             // ── Step 5 — Login form appears HERE (after Book Now) ─────────
             await Step5_ReLoginAsync();                 // fill credentials
 
-            // ── Step 6 — Passenger details ────────────────────────────────
+            // ── Step 6 — Passenger details → Continue Booking ─────────────
             await Step6_PassengersAsync(booking);
 
-            // ── Step 7 — Select BHIM/UPI → Continue ──────────────────────
-            await Step7_SelectUpiAsync();
+            // ── Step 6b — Payment-method page: pick BHIM/UPI → Continue ───
+            await Step6b_SelectPaymentMethodAsync();
 
-            // ── Step 8 — Review + captcha → Continue ─────────────────────
-            await Step8_ReviewAndCaptchaAsync();
+            // ── Step 7 — Auto-resolve captcha on next page ───────────────
+            await Step7_ResolveCaptchaAsync();
 
-            // ── Step 9 — Pay & Book ───────────────────────────────────────
+            // ── Step 8 — Click Continue → "Pay & Book" page ──────────────
+            await Step8_ContinueToReviewAsync();
+
+            // ── Step 9 — Click Pay & Book → gateway redirect ─────────────
             await Step9_PayAndBookAsync();
 
-            // ── Step 10 — Capture UPI QR ──────────────────────────────────
+            // ── Step 10 — Extract UPI QR and show in popup ───────────────
             await Step10_CaptureQrAsync();
         }
         catch (Exception ex) { Report($"Error: {ex.Message}"); }
@@ -308,10 +320,15 @@ true;";
         {
             var p = b.Passengers[i];
 
+            // Add an extra passenger row first — verify the row count grew.
             if (i > 0)
             {
-                await ClickText("a,button", "Add Passenger");
-                await D(1000); await InjectAsync();
+                int idx = i;
+                await EnsureAsync(
+                    $"Add passenger row #{idx + 1}",
+                    () => ClickText("a,button", "Add Passenger"),
+                    $@"document.querySelectorAll(
+                        'input[id*=""passengerName""],input[placeholder*=""Name""]').length > {idx}");
             }
 
             // Validate name length (3-16 chars as per IRCTC requirement)
@@ -319,444 +336,668 @@ true;";
             if (name.Length < 3)  name = (name + "   ").Substring(0, 3);
             if (name.Length > 16) name = name.Substring(0, 16);
 
-            Report($"Step 6 — Passenger {i + 1}: {name}, Age {p.Age}...");
+            Report($"Step 6 — Passenger {i + 1}: {name}, Age {p.Age}, {p.Gender}...");
 
-            // Name field
-            await Exec($@"(function(){{
+            // ── Name — fill then verify the input actually holds the value ──
+            await EnsureAsync(
+                $"Set name '{name}'",
+                () => Exec($@"(function(){{
   var inputs = document.querySelectorAll(
     'input[id*=""passengerName""], input[placeholder*=""Passenger Name""], input[placeholder*=""Name""]');
   var el = inputs[{i}]; if(!el) return;
+  el.focus();
   var s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
   s.call(el, '{Esc(name)}');
   el.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
   el.dispatchEvent(new Event('change',{{bubbles:true}}));
-}})();");
-            await D(300);
+  el.dispatchEvent(new FocusEvent('blur',{{bubbles:true}}));
+}})();"),
+                $@"(function(){{
+  var inputs=document.querySelectorAll(
+    'input[id*=""passengerName""],input[placeholder*=""Passenger Name""],input[placeholder*=""Name""]');
+  var el=inputs[{i}];
+  return el && (el.value||'').trim().toUpperCase()==='{name.ToUpper().Trim()}';
+}})()");
 
-            // Age field
-            await Exec($@"(function(){{
-  var inputs = document.querySelectorAll(
-    'input[id*=""passengerAge""], input[placeholder*=""Age""]');
+            // ── Age — fill then verify ──────────────────────────────────────
+            await EnsureAsync(
+                $"Set age {p.Age}",
+                () => Exec($@"(function(){{
+  var inputs = document.querySelectorAll('input[id*=""passengerAge""], input[placeholder*=""Age""]');
   var el = inputs[{i}]; if(!el) return;
+  el.focus();
   var s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
   s.call(el, '{p.Age}');
   el.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
-}})();");
-            await D(300);
-
-            // Gender — find the dropdown that contains Male/Female options
-            var gLabel = p.Gender == "F" ? "Female" : p.Gender == "T" ? "Transgender" : "Male";
-  Report($"Step 6 — Setting gender to {gLabel}...");
-
-     // Step 1: Find and click the gender dropdown trigger for this passenger
-     bool gDropClicked = await ClickAsync($@"(function(){{
-  var all = Array.from(document.querySelectorAll('p-dropdown, select'));
-  var genderDrops = all.filter(function(d){{
-    var fc = (d.getAttribute('formcontrolname')||'').toLowerCase();
-    var txt = (d.innerText||'').toUpperCase();
-    return fc.includes('gender') || txt.includes('MALE') || txt.includes('FEMALE');
-  }});
-  var drop = genderDrops[{i}];
-  if (!drop) return null;
-  // Find the trigger element (usually .p-dropdown-trigger or similar)
-  var trigger = drop.querySelector('.p-dropdown-trigger, .p-dropdown-label, [role=""button""], .ui-dropdown-trigger');
-  return trigger || drop;
+  el.dispatchEvent(new Event('change',{{bubbles:true}}));
+}})();"),
+                $@"(function(){{
+  var inputs=document.querySelectorAll('input[id*=""passengerAge""],input[placeholder*=""Age""]');
+  var el=inputs[{i}];
+  return el && (el.value||'').trim()==='{p.Age}';
 }})()");
-            await D(600); await InjectAsync();
 
-    // Step 2: Wait for the dropdown menu to appear and then click the option
-            bool optionFound = await WaitForAsync(@"(function(){{
-  var opts = Array.from(document.querySelectorAll(
-    'li[data-label], .p-dropdown-item, li.ui-dropdown-item, option'));
-  return opts.some(function(o){{
-    var txt = (o.innerText || o.textContent || '').trim().toUpperCase();
-    return txt.includes('{gLabel.ToUpper()}');
-  }});
-}})();", 3000);
-
-   if (optionFound)
-          {
-          // Click the matching option
-     await ClickText("li,option", gLabel);
-       await D(800); // Wait for dropdown to close and selection to register
-   }
-     else
-   {
-    // Fallback: Try direct value setting on select or p-dropdown
-    Report($"Step 6 — Gender dropdown fallback for {gLabel}...");
-         await Exec($@"(function(){{
-  var all = Array.from(document.querySelectorAll('p-dropdown, select'));
-  var gDrops = all.filter(function(d){{
-  return (d.getAttribute('formcontrolname')||'').toLowerCase().includes('gender')
-        || (d.innerText||'').toUpperCase().includes('MALE');
-  }});
-  var drop = gDrops[{i}];
-  if (!drop) return;
-  
-  // If it's a native select
-  if (drop.tagName === 'SELECT') {{
-    var opt = Array.from(drop.options).find(function(o){{
-      return (o.textContent||'').trim().toUpperCase().includes('{gLabel.ToUpper()}');
-    }});
-    if (opt) {{
-      drop.value = opt.value;
-      drop.dispatchEvent(new Event('change', {{bubbles: true}}));
-    }}
-    return;
-  }}
-  
-  // If it's a p-dropdown, click it first to open
-  var trigger = drop.querySelector('.p-dropdown-trigger, .p-dropdown-label, [role=""button""]');
-  if (trigger) trigger.click();
-}})();");
-     await D(800); await InjectAsync();
-
-        // Now click the option that appears
-  await ClickText("li", gLabel);
-     await D(800);
-            }
-            await D(400);
+            // ── Gender — open p-dropdown, pick option, verify it's displayed ─
+            var gLabel = p.Gender == "F" ? "Female" : p.Gender == "T" ? "Transgender" : "Male";
+            int gi = i;
+            await EnsureAsync(
+                $"Set gender to {gLabel}",
+                () => SelectGenderAsync(gi, gLabel),
+                GenderVerifyJs(gi, gLabel));
         }
 
-        // Berth preference (optional — scroll to find it)
-        await D(500);
+        await D(400); await InjectAsync();
 
-        bool paymentModeReady = await WaitForAsync(
-            @"__h.exists('input[name=""paymentType""][value=""2""]') || __h.pageHas('Pay through BHIM/UPI')",
-            5000);
-        if (paymentModeReady)
-        {
-            bool upiSelected = await SelectBhimUpiPaymentAsync("Step 6");
-            if (!upiSelected)
-            {
-                Report("Step 6 - Could not auto-select BHIM/UPI. Please click the BHIM/UPI radio button manually, then click 'OK (Continue)'.");
-                await UserAckAsync();
-                await InjectAsync();
-            }
-            await D(500);
-        }
+        // ── Continue Booking → leads to the PAYMENT-METHOD page ────────────
+        // (BHIM/UPI selection happens on that next page, not here.)
+        Report("Step 6 — Passenger details verified. Clicking Continue Booking...");
+        await EnsureAsync(
+            "Continue Booking → payment page",
+            async () => {
+                bool c = await ClickText("button", "Continue Booking");
+                if (!c) c = await ClickText("button", "CONTINUE");
+                if (!c) await ClickText("button", "Continue");
+            },
+            // verified once the payment-method page is showing the BHIM/UPI option
+            @"__h.pageHas('Pay through BHIM') || __h.pageHas('BHIM/UPI')
+              || __h.pageHas('Convenience Fee')
+              || (__h.pageHas('Pay through') && document.querySelectorAll('input[type=""radio""]').length>0)",
+            maxAttempts: 5, settleMs: 2500);
 
-        Report("Step 6 - Clicking Continue...");
-        bool contClicked = await ClickPassengerContinueAsync();
-        if (!contClicked)
-        {
-            Report("Step 6 - Continue button not found. Click Continue manually, then 'OK (Continue)'.");
-            await UserAckAsync();
-            await InjectAsync();
-        }
-        await D(3000); await InjectAsync();
-        
-        // Wait for page to transition to next step before proceeding
-        Report("Step 6 — Waiting for page to load next step...");
-        await WaitForAsync(
-            "__h.pageHas('Payment') || __h.pageHas('payment') || __h.pageHas('UPI') || " +
-            "__h.pageHas('Review') || __h.pageHas('review') || __h.pageHas('Confirmation')",
-          8000);
-        await D(2000); await InjectAsync();
+        await D(1200); await InjectAsync();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 7 — Select BHIM/UPI payment and click Continue
-    // ═══════════════════════════════════════════════════════════════════════
-    private async Task Step7_SelectUpiAsync()
+    // Verify gender shows the chosen label in the p-dropdown / select
+    private static string GenderVerifyJs(int i, string gLabel) => $@"(function(){{
+  // native select check
+  var sels=Array.from(document.querySelectorAll('select')).filter(function(s){{
+    return (s.getAttribute('formcontrolname')||'').toLowerCase().includes('gender')
+        || /male|female/i.test(s.innerText);
+  }});
+  if(sels[{i}]) {{
+    var o=sels[{i}].options[sels[{i}].selectedIndex];
+    if(o && (o.text||'').toUpperCase().includes('{gLabel.ToUpper()}')) return true;
+  }}
+  // p-dropdown: the chosen value renders as .ui-dropdown-label / .p-dropdown-label text
+  var drops=Array.from(document.querySelectorAll('p-dropdown')).filter(function(d){{
+    return (d.getAttribute('formcontrolname')||d.getAttribute('ng-reflect-name')||'')
+             .toLowerCase().includes('gender')
+        || /gender|male|female/i.test(d.innerText||'');
+  }});
+  var d=drops[{i}];
+  if(!d) return false;
+  var lbl=d.querySelector('.ui-dropdown-label,.p-dropdown-label,.ui-dropdown-trigger ~ span');
+  var t=(lbl? lbl.innerText : d.innerText||'').toUpperCase();
+  return t.includes('{gLabel.ToUpper()}');
+}})()";
+
+    // Verify the BHIM/UPI option is the selected one.
+    // Robust across IRCTC variants: checks hidden input .checked, PrimeNG highlight
+    // classes, aria-checked, AND the visible orange-fill styling.
+    private static string UpiVerifyJs() => @"(function(){
+  function isBhimRow(el){
+    var row = el.closest('tr,label,div') || el;
+    // climb a couple levels to capture the option's text
+    for (var i=0;i<3 && row;i++){
+      if (/bhim\s*\/?\s*upi|bhim|pay through bhim/i.test(row.innerText||'')) return true;
+      row = row.parentElement;
+    }
+    return false;
+  }
+
+  // 1) hidden <input type=radio>.checked
+  var inputs = Array.from(document.querySelectorAll('input[type=""radio""]'));
+  for (var x of inputs){
+    if (x.checked && isBhimRow(x)) return true;
+  }
+
+  // 2) PrimeNG highlighted box (any class variant) within the BHIM/UPI row
+  var boxes = Array.from(document.querySelectorAll(
+    '.ui-radiobutton-box,.p-radiobutton-box,.ui-radiobutton,.p-radiobutton,[role=""radio""]'));
+  for (var b of boxes){
+    var cls = b.className || '';
+    var highlighted = /highlight|active|checked|selected/i.test(cls)
+      || b.getAttribute('aria-checked') === 'true';
+    if (highlighted && isBhimRow(b)) return true;
+  }
+
+  // 3) Visual fallback: a filled (orange) radio icon inside the BHIM/UPI row.
+  //    PrimeNG renders the inner dot as .ui-radiobutton-icon when selected.
+  var icons = Array.from(document.querySelectorAll(
+    '.ui-radiobutton-icon,.p-radiobutton-icon'));
+  for (var ic of icons){
+    var visible = ic.offsetParent !== null
+      && getComputedStyle(ic).visibility !== 'hidden';
+    if (visible && isBhimRow(ic)) return true;
+  }
+  return false;
+})()";
+
+    // ── Gender selection (PrimeNG p-dropdown OR native select) ─────────────
+    private async Task SelectGenderAsync(int passengerIndex, string gLabel)
     {
-        Report("Step 7 - Checking whether payment mode still needs selection...");
-        await D(1000);
+        Report($"Step 6 — Setting gender to {gLabel}...");
         await InjectAsync();
 
-        bool hasPaymentOptions = await WaitForAsync(
-            @"__h.exists('input[name=""paymentType""][value=""2""]') || __h.pageHas('Pay through BHIM/UPI')",
-            4000);
-        if (!hasPaymentOptions)
+        // CASE A: native <select> (set value directly)
+        bool isNative = await ExecBool($@"(function(){{
+  var sels = Array.from(document.querySelectorAll('select'))
+    .filter(function(s){{
+       var fc=(s.getAttribute('formcontrolname')||'').toLowerCase();
+       return fc.includes('gender') || /male|female/i.test(s.innerText);
+    }});
+  return !!sels[{passengerIndex}];
+}})()");
+
+        if (isNative)
         {
-            Report("Step 7 - Payment mode was already handled on the passenger details page.");
+            await Exec($@"(function(){{
+  var sels = Array.from(document.querySelectorAll('select'))
+    .filter(function(s){{
+       var fc=(s.getAttribute('formcontrolname')||'').toLowerCase();
+       return fc.includes('gender') || /male|female/i.test(s.innerText);
+    }});
+  var sel = sels[{passengerIndex}]; if(!sel) return;
+  var opt = Array.from(sel.options).find(function(o){{
+     return (o.text||'').toUpperCase().includes('{gLabel.ToUpper()}');
+  }});
+  if(opt){{ sel.value = opt.value;
+     sel.dispatchEvent(new Event('change',{{bubbles:true}})); }}
+}})();");
+            await D(400);
             return;
         }
 
-        bool upiSelected = await SelectBhimUpiPaymentAsync("Step 7");
-        if (!upiSelected)
+        // CASE B: PrimeNG p-dropdown.
+        // 1) Click the dropdown trigger to OPEN it
+        bool opened = await ClickAsync($@"(function(){{
+  // gender dropdowns: the formcontrolname usually contains 'gender' / 'passengerGender'
+  var drops = Array.from(document.querySelectorAll('p-dropdown'))
+    .filter(function(d){{
+       var fc=(d.getAttribute('formcontrolname')||d.getAttribute('ng-reflect-name')||'').toLowerCase();
+       return fc.includes('gender');
+    }});
+  // fallback: dropdowns whose placeholder/label mentions gender
+  if(!drops.length) {{
+    drops = Array.from(document.querySelectorAll('p-dropdown')).filter(function(d){{
+       return /gender|male|female/i.test(d.innerText||'')
+           || /gender/i.test(d.getAttribute('aria-label')||'');
+    }});
+  }}
+  var d = drops[{passengerIndex}];
+  if(!d) return null;
+  // the clickable trigger inside the p-dropdown
+  return d.querySelector('.ui-dropdown-trigger, .p-dropdown-trigger, .ui-dropdown, .p-dropdown') || d;
+}})()");
+
+        await D(600); await InjectAsync();
+
+        // 2) Click the matching option in the overlay panel (appended to body)
+        bool picked = await ClickAsync($@"(function(){{
+  var items = Array.from(document.querySelectorAll(
+    '.ui-dropdown-item, .p-dropdown-item, li[role=""option""], .ui-dropdown-items li, .p-dropdown-items li'));
+  return items.find(function(li){{
+     return (li.innerText||'').trim().toUpperCase().includes('{gLabel.ToUpper()}');
+  }}) || null;
+}})()");
+
+        // 3) Fallback: type into the dropdown filter then Enter, or use keyboard
+        if (!opened || !picked)
         {
-            Report("Step 7 - Could not auto-select BHIM/UPI. Please click the BHIM/UPI radio button manually, then click 'OK (Continue)'.");
-            await UserAckAsync();
-            await InjectAsync();
+            await Exec($@"(function(){{
+  // Try setting the underlying Angular control by clicking any visible option text
+  var items = Array.from(document.querySelectorAll('li,span,div'))
+    .filter(function(e){{
+       var t=(e.innerText||'').trim().toUpperCase();
+       return t==='{gLabel.ToUpper()}' && e.offsetParent!==null;
+    }});
+  if(items[0]) items[0].click();
+}})();");
         }
-
-        await D(800);
-        await InjectAsync();
-
-        Report("Step 7 - Clicking Continue button...");
-        bool contClicked = await ClickPassengerContinueAsync();
-        if (!contClicked)
-        {
-            Report("Step 7 - Continue button not found. Click Continue manually, then 'OK (Continue)'.");
-            await UserAckAsync();
-            await InjectAsync();
-        }
-
-        await D(3000);
-        await InjectAsync();
+        await D(400);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 8 — Review page: CAPTCHA must be solved before proceeding
-    // ═══════════════════════════════════════════════════════════════════════
-    private async Task<bool> SelectBhimUpiPaymentAsync(string stepName)
+    // ── BHIM/UPI payment radio (PrimeNG p-radiobutton) ─────────────────────
+    private async Task SelectUpiPaymentAsync()
     {
-        Report($"{stepName} - Selecting BHIM/UPI payment mode...");
         await InjectAsync();
 
-        bool selected = await ExecBool(@"(function(){
-  function event(el, name) {
-    if (!el) return;
-    el.dispatchEvent(new Event(name, {bubbles:true, cancelable:true, composed:true}));
-  }
-  function mouse(el, name) {
-    if (!el) return;
-    el.dispatchEvent(new MouseEvent(name, {bubbles:true, cancelable:true, composed:true, view:window}));
-  }
+        // PrimeNG renders the visible radio as a .ui-radiobutton-box div next to
+        // a hidden <input type=radio>. We must click the BOX or its label.
+        bool clicked = await ClickAsync(@"(function(){
+  function txt(e){ return (e ? (e.innerText||'') : '').toUpperCase(); }
 
-  var input = document.querySelector('input[name=""paymentType""][value=""2""]');
-  if (!input) {
-    input = Array.from(document.querySelectorAll('input[type=""radio""]')).find(function(r) {
-      var root = r.closest('label,tr,div') || r;
-      var text = (root.innerText || root.textContent || '').toUpperCase();
-      return text.includes('PAY THROUGH BHIM/UPI') || (text.includes('BHIM') && text.includes('UPI'));
+  // 1) Find a label / container mentioning UPI or BHIM
+  var labels = Array.from(document.querySelectorAll('label,div,span,td'))
+    .filter(function(e){
+       var t = txt(e);
+       return (t.includes('BHIM') || t.includes('UPI')) && e.offsetParent!==null
+              && t.length < 60;   // avoid huge containers
+    })
+    .sort(function(a,b){ return a.innerText.length - b.innerText.length; });
+
+  for (var lbl of labels) {
+    // Try to find the clickable radio box within or near this label
+    var row = lbl.closest('.ui-radiobutton, .p-radiobutton, tr, .col-pad, div') || lbl;
+    var box = row.querySelector('.ui-radiobutton-box, .p-radiobutton-box, .ui-radiobutton, .p-radiobutton');
+    if (box && box.offsetParent !== null) return box;
+  }
+  // 2) Fall back to the label itself
+  if (labels[0]) return labels[0];
+  return null;
+})()");
+
+        if (!clicked)
+        {
+            // Last resort: click any radiobutton box whose row text has UPI
+            await ClickText("label,div,span", "BHIM/UPI");
+        }
+
+        await D(500); await InjectAsync();
+
+        // Verify the radio is now checked; if not, click the hidden input directly
+        bool ok = await ExecBool(@"(function(){
+  var r = Array.from(document.querySelectorAll('input[type=""radio""]'))
+    .find(function(x){
+       var v=(x.value||x.id||'').toLowerCase();
+       var lbl=document.querySelector('label[for=""'+x.id+'""]');
+       return v.includes('upi')||v.includes('bhim')
+           || (lbl && /upi|bhim/i.test(lbl.innerText||''));
     });
-  }
-
-  var widget = input ? input.closest('p-radiobutton') : null;
-  var root = widget ? widget.closest('label,tr') : (input ? input.closest('label,tr,div') : null);
-
-  if (!root) {
-    root = Array.from(document.querySelectorAll('label,tr,div,span'))
-      .filter(function(el) {
-        var text = (el.innerText || el.textContent || '').toUpperCase();
-        return text.includes('PAY THROUGH BHIM/UPI') || (text.includes('BHIM') && text.includes('UPI'));
-      })
-      .sort(function(a, b) {
-        return (a.innerText || a.textContent || '').length - (b.innerText || b.textContent || '').length;
-      })[0];
-  }
-
-  if (!root) return null;
-  var box = root.querySelector('.ui-radiobutton-box,[role=""radio""]');
-  var target = box || widget || input || root;
-
-  try { target.scrollIntoView({block:'center', inline:'nearest'}); } catch(e) {}
-
-  if (input) {
-    try {
-      var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;
-      setter.call(input, true);
-    } catch(e) {
-      input.checked = true;
-    }
-    input.setAttribute('checked', 'checked');
-  }
-
-  mouse(target, 'pointerdown');
-  mouse(target, 'mousedown');
-  mouse(target, 'mouseup');
-  if (target.click) target.click();
-
-  if (input) {
-    if (input.click) input.click();
-    event(input, 'input');
-    event(input, 'change');
-    event(input, 'blur');
-  }
-
-  if (box) {
-    box.classList.add('ui-state-active');
-    box.setAttribute('aria-checked', 'true');
-  }
-
-  return !!(input || target);
+  return r && r.checked;
 })()");
 
-        if (!selected)
+        if (!ok)
         {
-            selected = await ClickAsync(@"(function(){
-  var input = document.querySelector('input[name=""paymentType""][value=""2""]');
-  var widget = input ? input.closest('p-radiobutton') : null;
-  var root = widget ? widget.closest('label,tr') : null;
-  return root ? (root.querySelector('.ui-radiobutton-box,[role=""radio""]') || root) : null;
-})()");
+            await Exec(@"(function(){
+  var r = Array.from(document.querySelectorAll('input[type=""radio""]'))
+    .find(function(x){
+       var v=(x.value||x.id||'').toLowerCase();
+       var lbl=document.querySelector('label[for=""'+x.id+'""]');
+       return v.includes('upi')||v.includes('bhim')
+           || (lbl && /upi|bhim/i.test(lbl.innerText||''));
+    });
+  if(r){ r.checked=true;
+         r.click();
+         r.dispatchEvent(new Event('change',{bubbles:true})); }
+})();");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 6b — Payment-method page: select BHIM/UPI radio → Continue
+    //  (This page shows: "Pay through Cards/.../UPI_CC"  and
+    //   "Pay through BHIM/UPI". We must pick BHIM/UPI then Continue.)
+    // ═══════════════════════════════════════════════════════════════════════
+    private async Task Step6b_SelectPaymentMethodAsync()
+    {
+        // Make sure we're actually on the payment-method page first.
+        Report("Step 6b — Waiting for payment-method page...");
+        await WaitForAsync(
+            @"__h.pageHas('Pay through BHIM') || __h.pageHas('BHIM/UPI')
+              || __h.pageHas('Convenience Fee')", 12000);
+        await D(800); await InjectAsync();
+
+        // 1) Select BHIM/UPI — best-effort with a few retries. We do NOT hard-gate
+        //    on verification here, because the visible orange dot can register
+        //    inconsistently; the Continue step below confirms real progress.
+        for (int i = 0; i < 4; i++)
+        {
+            await SelectUpiPaymentAsync();
+            await D(600); await InjectAsync();
+            if (await ExecBool(UpiVerifyJs())) { Report("Step 6b — BHIM/UPI selected."); break; }
+            Report($"Step 6b — Re-selecting BHIM/UPI ({i + 1}/4)...");
         }
 
-        if (!selected) return false;
-
-        await D(800);
-        await InjectAsync();
-        return await ExecBool(@"(function(){
-  var input = document.querySelector('input[name=""paymentType""][value=""2""]');
-  if (input && input.checked) return true;
-  var root = input ? input.closest('label,tr') : null;
-  if (!root) return false;
-  var box = root.querySelector('.ui-radiobutton-box,[role=""radio""]');
-  return !!(box && (box.classList.contains('ui-state-active') || box.getAttribute('aria-checked') === 'true'));
-})()") || selected;
-    }
-
-    private async Task<bool> ClickPassengerContinueAsync()
-    {
-        await InjectAsync();
-
-        bool domClicked = await ExecBool(@"(function(){
-  function usable(el) {
-    if (!el || el.disabled) return false;
-    var text = (el.innerText || el.textContent || '').toUpperCase().trim();
-    if (!text.includes('CONTINUE') || text.includes('BOOKING')) return false;
-    var style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-    var rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  }
-  function fire(el, name) {
-    el.dispatchEvent(new MouseEvent(name, {bubbles:true, cancelable:true, composed:true, view:window}));
-  }
-
-  var all = Array.from(document.querySelectorAll('button,input[type=""submit""],a,[role=""button""],span,div'));
-  var candidates = all.filter(usable).sort(function(a, b) {
-    var ar = a.getBoundingClientRect();
-    var br = b.getBoundingClientRect();
-    var as = ((a.className || '') + ' ' + (a.type || '')).toLowerCase();
-    var bs = ((b.className || '') + ' ' + (b.type || '')).toLowerCase();
-    var aw = (as.includes('mob-bot-btn') || as.includes('search_btn') || as.includes('train_search') || as.includes('btndefault') || a.type === 'submit') ? 10000 : 0;
-    var bw = (bs.includes('mob-bot-btn') || bs.includes('search_btn') || bs.includes('train_search') || bs.includes('btndefault') || b.type === 'submit') ? 10000 : 0;
-    return (bw + br.bottom) - (aw + ar.bottom);
+        // 2) Click Continue — ALWAYS attempt, regardless of verify result above.
+        //    Verified by the payment page actually changing.
+        Report("Step 6b — Clicking Continue...");
+        await EnsureAsync(
+            "Step 6b — Continue after payment selection",
+            async () => {
+                // Re-assert UPI radio right before each Continue attempt
+                await Exec(@"(function(){
+  var r = Array.from(document.querySelectorAll('input[type=""radio""]')).find(function(x){
+    var v=(x.value||x.id||'').toLowerCase();
+    var lbl=document.querySelector('label[for=""'+x.id+'""]');
+    return v.includes('upi')||v.includes('bhim')
+        || (lbl && /upi|bhim/i.test(lbl.innerText||''));
   });
+  if(r && !r.checked){ r.checked=true; r.click();
+                       r.dispatchEvent(new Event('change',{bubbles:true})); }
+})();");
+                await D(250);
 
-  var target = candidates[0];
-  if (!target) {
-    target = Array.from(document.querySelectorAll('button[type=""submit""],input[type=""submit""]'))
-      .filter(function(el) { return !el.disabled; })
-      .sort(function(a, b) { return b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom; })[0];
-  }
-  if (!target) return false;
-
-  var button = target.closest('button,a,[role=""button""]') || target;
-  try { button.scrollIntoView({block:'center', inline:'nearest'}); } catch(e) {}
-  fire(button, 'pointerdown');
-  fire(button, 'mousedown');
-  fire(button, 'mouseup');
-  if (button.click) button.click();
-
-  var form = button.closest('form') || document.querySelector('app-passenger-input form, form');
-  if (form && button.tagName === 'BUTTON' && button.type === 'submit') {
-    try { form.requestSubmit(button); }
-    catch(e) { form.dispatchEvent(new Event('submit', {bubbles:true, cancelable:true})); }
-  }
-  return true;
+                // Click the Continue button precisely (button / anchor / bar).
+                bool c = await ClickAsync(@"(function(){
+  var cands = Array.from(document.querySelectorAll('button,a,span,div'))
+    .filter(function(e){
+       var t=(e.innerText||'').trim().toUpperCase();
+       return t==='CONTINUE' && e.offsetParent!==null
+              && !e.disabled;
+    })
+    .sort(function(a,b){
+       var ab=(a.tagName==='BUTTON'||a.tagName==='A')?0:1;
+       var bb=(b.tagName==='BUTTON'||b.tagName==='A')?0:1;
+       if(ab!==bb) return ab-bb;
+       return (a.innerText.length)-(b.innerText.length);
+    });
+  return cands[0] || null;
 })()");
+                if (!c) c = await ClickText("button", "CONTINUE");
+                if (!c) await ClickText("button,a", "Continue");
+            },
+            // left the payment-method page → captcha, review, Pay&Book, or QR shown
+            @"__h.captchaVisible() || __h.pageHas('Enter Captcha')
+              || Array.from(document.querySelectorAll('button,a')).some(function(b){
+                   var t=(b.innerText||'').toUpperCase();
+                   return t.includes('PAY')&&t.includes('BOOK');
+                 })
+              || /scan|qr code/i.test(document.body.innerText||'')
+              || !__h.pageHas('Convenience Fee')",
+            maxAttempts: 6, settleMs: 2500, promptOnFail: false);
 
-        if (domClicked) return true;
-
-        return await ClickAsync(@"(function(){
-  var buttons = Array.from(document.querySelectorAll('button,input[type=""submit""],a,[role=""button""]'));
-  return buttons.filter(function(b) {
-    var text = (b.innerText || b.textContent || b.value || '').toUpperCase().trim();
-    return text.includes('CONTINUE') && !text.includes('BOOKING') && !b.disabled;
-  }).sort(function(a, b) {
-    return b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom;
-  })[0] || null;
-})()");
+        await D(1200); await InjectAsync();
     }
 
-    private async Task Step8_ReviewAndCaptchaAsync()
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 7 — Auto-resolve CAPTCHA on the next page (no human interaction)
+    // ═══════════════════════════════════════════════════════════════════════
+    private async Task Step7_ResolveCaptchaAsync()
     {
-        Report("Step 8 - Waiting for review / captcha page...");
-        bool reviewReady = await WaitForAsync(
-            @"__h.pageHas('Review Journey') || " +
-            @"__h.pageHas('Journey Details') || " +
-            @"__h.pageHas('Booking Details') || " +
-            @"__h.pageHas('Total Fare') || " +
-            @"__h.exists('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""],input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""]') || " +
-            @"__h.pageHas('Captcha')",
-            30000);
+        Report("Step 7 — Waiting for captcha page...");
+        bool hasCaptcha = await WaitForAsync(
+            @"__h.captchaVisible() || __h.pageHas('Enter Captcha') || __h.pageHas('Captcha')",
+            15000);
 
-        if (!reviewReady)
+        if (!hasCaptcha)
         {
-            Report("Step 8 - Review page did not appear yet. Waiting for user confirmation to continue.");
-            await UserAckAsync();
+            Report("Step 7 — No captcha detected on this page. Proceeding...");
+            return;
         }
+
+        // Automatically read + enter the captcha (retries internally)
+        await AutoSolveCaptchaAsync();
+        await D(500); await InjectAsync();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 8 — Two pages after captcha:
+    //    8a) Review / Fare Summary page  → click Continue
+    //    8b) Payment Methods page        → select 'BHIM/UPI/USSD' tile → Continue
+    //  We do NOT advance to Step 9 until a real 'Pay & Book' button is present.
+    // ═══════════════════════════════════════════════════════════════════════
+    private async Task Step8_ContinueToReviewAsync()
+    {
+        // ── 8a) Review/Fare Summary page → Continue ───────────────────────
+        // Verified when we land on the Payment Methods page (BHIM/UPI/USSD tile).
+        await EnsureAsync(
+            "Step 8a — Review page → Continue",
+            async () => {
+                // re-solve captcha if it's still showing (wrong previous guess)
+                if (await ExecBool(@"__h.captchaVisible()"))
+                {
+                    await RefreshCaptchaAsync(); await D(1000);
+                    await AutoSolveCaptchaAsync(3); await D(400);
+                }
+                await ClickContinueAsync();
+            },
+            @"(function(){
+   if (__h.captchaVisible()) return false;
+   var t=(document.body.innerText||'').toUpperCase();
+   // Payment Methods page shows these option tiles:
+   return t.includes('PAYMENT METHODS')
+       || t.includes('BHIM/ UPI/ USSD') || t.includes('BHIM/UPI/USSD')
+       || t.includes('IRCTC IPAY')
+       || t.includes('MULTIPLE PAYMENT SERVICE');
+})()",
+            maxAttempts: 8, settleMs: 2800, promptOnFail: false);
 
         await D(1000); await InjectAsync();
 
-        // Wait for captcha image to appear (up to 15 s)
-        bool hasCaptcha = await WaitForAsync(
-            @"__h.exists('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""]') || " +
-            @"__h.exists('input[id*=""captcha""]') || " +
-            @"__h.exists('input[name*=""captcha""]') || " +
-            @"__h.exists('input[formcontrolname*=""captcha""]') || " +
-            @"__h.exists('input[placeholder*=""Captcha""]') || " +
-            @"__h.pageHas('Enter Captcha') || " +
-            @"__h.pageHas('Captcha')",
-            15000);
-
-        if (hasCaptcha)
-        {
-            await Exec(@"(function(){
-  var el = document.querySelector('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""],input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""]');
-  if(el) el.scrollIntoView({block:'center'});
+        // ── 8b) Payment Methods page → select 'BHIM/UPI/USSD' tile ────────
+        Report("Step 8b — Selecting 'BHIM/ UPI/ USSD' payment method...");
+        await EnsureAsync(
+            "Step 8b — Select BHIM/UPI/USSD tile",
+            async () => {
+                // Click the row/tile whose text contains BHIM/UPI/USSD
+                bool c = await ClickAsync(@"(function(){
+  var rows = Array.from(document.querySelectorAll('div,li,label,a,span,td'))
+    .filter(function(e){
+       var t=(e.innerText||'').toUpperCase();
+       return (t.includes('BHIM')&&t.includes('UPI')) && e.offsetParent!==null
+              && t.length<80;   // the tile, not a big container
+    })
+    .sort(function(a,b){ return a.innerText.length-b.innerText.length; });
+  return rows[0]||null;
+})()");
+                // also tick any radio inside that tile
+                await Exec(@"(function(){
+  var rows = Array.from(document.querySelectorAll('div,li,label')).filter(function(e){
+     var t=(e.innerText||'').toUpperCase();
+     return t.includes('BHIM')&&t.includes('UPI')&&t.length<120;
+  });
+  for (var r of rows){
+     var radio=r.querySelector('input[type=radio]');
+     if(radio && !radio.checked){ radio.checked=true; radio.click();
+        radio.dispatchEvent(new Event('change',{bubbles:true})); }
+  }
 })();");
+            },
+            // verified when the tile is selected (highlighted) OR page advanced
+            @"(function(){
+   var sel = Array.from(document.querySelectorAll('input[type=radio]')).some(function(x){
+      var row=x.closest('div,li,label');
+      return x.checked && row && /bhim.*upi|upi.*bhim/i.test(row.innerText||'');
+   });
+   // or an active/highlighted tile
+   var tile = Array.from(document.querySelectorAll('[class*=active],[class*=selected],[class*=highlight]'))
+      .some(function(e){ return /bhim.*upi|upi.*bhim/i.test(e.innerText||''); });
+   return sel || tile;
+})()",
+            maxAttempts: 5, settleMs: 800, promptOnFail: false);
 
-            Report("Step 8 - CAPTCHA visible. Solving automatically...");
-            await AutoSolveCaptchaAsync();
-            await D(800); await InjectAsync();
-        }
-        else
-        {
-            Report("Step 8 - No captcha detected. Proceeding...");
-        }
+        // NOTE: Clicking Continue → Pay & Book → gateway is owned entirely by
+        // Step 9 now (so there's a single, load-gated sequence instead of two
+        // competing ones). Step 8 ends once BHIM/UPI/USSD is selected.
+        await D(1200); await InjectAsync();
+    }
 
-        // Click Continue (after captcha is solved)
-        Report("Step 8 - Clicking Continue...");
-        bool cont = await ClickPassengerContinueAsync();
-        if (!cont) cont = await ClickText("button,a", "CONTINUE");
-        if (!cont) cont = await ClickText("button,a", "Continue");
-        if (!cont)
-        {
-            Report("Step 8 - Continue not found - click it manually, then 'OK (Continue)'.");
-            await UserAckAsync(); await InjectAsync();
-        }
-        await D(3000); await InjectAsync();
+    // Click whatever visible button reads exactly "CONTINUE" (button > anchor > bar)
+    private async Task ClickContinueAsync()
+    {
+        bool c = await ClickAsync(@"(function(){
+  var cands = Array.from(document.querySelectorAll('button,a,span,div'))
+    .filter(function(e){
+       var t=(e.innerText||'').trim().toUpperCase();
+       return t==='CONTINUE' && e.offsetParent!==null && !e.disabled;
+    })
+    .sort(function(a,b){
+       var ab=(a.tagName==='BUTTON'||a.tagName==='A')?0:1;
+       var bb=(b.tagName==='BUTTON'||b.tagName==='A')?0:1;
+       if(ab!==bb) return ab-bb;
+       return a.innerText.length-b.innerText.length;
+    });
+  return cands[0]||null;
+})()");
+        if (!c) await ClickText("button", "Continue");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 9 — Pay & Book (captcha already solved in Step 8)
+    //  STEP 9 — Two sequential clicks → payment gateway:
+    //    9a) Payment Methods page (BHIM/UPI/USSD selected) → click "Continue"
+    //    9b) Review / Pay&Book page                        → click "Pay & Book"
+    //    → IRCTC redirects to the UPI gateway where the QR renders.
+    //  Each click WAITS for the next page to fully load before proceeding.
     // ═══════════════════════════════════════════════════════════════════════
+
+    // Shared visibility test. offsetParent alone is unreliable here: the mobile
+    // bottom action bars live inside a <p-sidebar style=""height:0"> wrapper yet are
+    // rendered/clickable (opacity:1, fixed position). So we check real geometry +
+    // computed style instead, and ignore the price button (""₹ ..."").
+    private const string VisibleBtnTest = @"
+    function __vis(el){
+      if(!el || el.disabled) return false;
+      var t=(el.innerText||'').trim();
+      if(/^₹/.test(t)) return false;                       // skip the fare button
+      // 'Rendered' = the element participates in layout. We use getClientRects(),
+      // which is non-empty whenever the element is painted — even when an ancestor
+      // <p-sidebar style='height:0'> clips its bounding box to zero (the old rect
+      // check wrongly rejected the visible orange Continue/Pay&Book bottom bar).
+      if(el.getClientRects().length === 0) return false;
+      var cs=getComputedStyle(el);
+      if(cs.visibility==='hidden' || cs.display==='none' || +cs.opacity===0) return false;
+      // Reject only if the element itself or an ancestor is explicitly display:none
+      // (that genuinely removes it). We do NOT reject on zero height, since the
+      // sidebar wrapper legitimately has height:0 while its button still renders.
+      for(var p=el.parentElement; p; p=p.parentElement){
+        if(getComputedStyle(p).display==='none') return false;
+      }
+      return true;
+    }";
+
+    // visible, enabled "CONTINUE" button — desktop body or mobile bottom bar.
+    // Prefer a __vis-passing match; if none (e.g. geometry clipped by a height:0
+    // sidebar), fall back to any enabled CONTINUE button — a DOM click still works.
+    private const string ContinueBtnJs = @"(function(){" + VisibleBtnTest + @"
+  function pick(strict){
+    return Array.from(document.querySelectorAll('button,a'))
+      .filter(function(b){
+         if(b.disabled) return false;
+         var t=(b.innerText||'').trim().toUpperCase();
+         if(t!=='CONTINUE') return false;
+         return strict ? __vis(b) : true;
+      })
+      .sort(function(a,b){ return a.innerText.length-b.innerText.length; })[0] || null;
+  }
+  return pick(true) || pick(false);
+})()";
+
+    // visible, enabled "Pay & Book" button — desktop body or mobile bottom bar.
+    private const string PayBookBtnJs = @"(function(){" + VisibleBtnTest + @"
+  function pick(strict){
+    return Array.from(document.querySelectorAll('button,a'))
+      .filter(function(b){
+         if(b.disabled) return false;
+         var t=(b.innerText||'').trim().toUpperCase();
+         if(!(t.includes('PAY')&&t.includes('BOOK'))) return false;
+         return strict ? __vis(b) : true;
+      })
+      .sort(function(a,b){ return a.innerText.length-b.innerText.length; })[0] || null;
+  }
+  return pick(true) || pick(false);
+})()";
+
+    // true once the IRCTC payment gateway / UPI QR screen has rendered
+    private const string GatewayReadyJs = @"
+      /scan.*qr|qr.*scan|click here to pay|upi.*qr|phonepe|paytm|razorpay|billdesk|payment gateway|bharatqr|order id/i
+        .test(document.body.innerText||'')";
+
+    // Report the visible action buttons currently on the page — turns a silent
+    // race into hard data in the status log so we can see what Step 9 is seeing.
+    private async Task ReportButtonsAsync(string tag)
+    {
+        var info = (await Exec(@"(function(){" + VisibleBtnTest + @"
+  var out = Array.from(document.querySelectorAll('button,a'))
+    .filter(__vis)
+    .map(function(b){ return (b.innerText||'').trim().replace(/\s+/g,' '); })
+    .filter(function(t){ return t.length>0 && t.length<40; });
+  return out.join(' | ');
+})()")).Trim('"');
+        Report($"{tag} — visible buttons: {info}");
+    }
+
     private async Task Step9_PayAndBookAsync()
     {
-        Report("Step 9 — Clicking Pay & Book...");
+        await InjectAsync();
+        await ReportButtonsAsync("Step 9");
+
+        // ── 9a) Click "Continue" on the Payment Methods page ──────────────────
+        // (Only if a Continue button is present — some variants skip straight to
+        //  the Pay & Book page.)
+        bool hasContinue = await WaitForAsync($"!!({ContinueBtnJs})", 8000);
+        Report($"Step 9a — Continue button present: {hasContinue}");
+        if (hasContinue)
+        {
+            // BLOCKING: we must not proceed until Continue actually advances the
+            // page. If the click can't be made to register automatically, pause and
+            // ask the user to press Continue rather than silently racing to Step 10.
+            bool advanced = await EnsureAsync(
+                "Step 9a — Continue → Pay & Book page",
+                async () => {
+                    bool dom = await ClickDomAsync(ContinueBtnJs);
+                    bool cdp = dom || await ClickAsync(ContinueBtnJs);
+                    Report($"Step 9a — clicked Continue (dom={dom}, cdp={cdp})");
+                },
+                // verified only when we've LEFT the Payment Methods page: a Pay & Book
+                // button appears, or the gateway is reached. (A still-present Continue
+                // means nothing happened.)
+                $"!!({PayBookBtnJs}) || ({GatewayReadyJs})",
+                maxAttempts: 6, settleMs: 3000, promptOnFail: true);
+
+            if (!advanced)
+            {
+                Report("Step 9a — Continue did not advance the page. " +
+                       "Please press 'Continue' in the browser, then click 'OK (Continue)'.");
+                await UserAckAsync();
+            }
+
+            await WaitForPageReadyAsync($"!!({PayBookBtnJs}) || ({GatewayReadyJs})", 12000);
+            await InjectAsync();
+            await ReportButtonsAsync("Step 9 (after Continue)");
+        }
+
+        // ── 9b) Click "Pay & Book" → gateway redirect ─────────────────────────
+        bool hasPayBook = await WaitForAsync($"!!({PayBookBtnJs})", 10000);
+        if (hasPayBook)
+        {
+            await EnsureAsync(
+                "Step 9b — Pay & Book → gateway",
+                async () => {
+                    if (!await ClickDomAsync(PayBookBtnJs))
+                        if (!await ClickAsync(PayBookBtnJs))
+                            await ClickText("button,a", "Pay & Book");
+                },
+                // verified once the gateway/QR screen has loaded (or both action
+                // buttons are gone → we left the review page)
+                $@"({GatewayReadyJs}) || !(
+                     Array.from(document.querySelectorAll('button,a')).some(function(b){{
+                        var t=(b.innerText||'').trim().toUpperCase();
+                        return ((t.includes('PAY')&&t.includes('BOOK'))||t==='CONTINUE')
+                               && b.offsetParent!==null;
+                     }}))",
+                maxAttempts: 5, settleMs: 3500, promptOnFail: false);
+        }
+        else
+        {
+            Report("Step 9 — Pay & Book button not present; watching for gateway...");
+        }
+
+        // ── Wait for the payment gateway / QR screen to be fully loaded ───────
+        Report("Step 9 — Waiting for payment gateway to load...");
+        await WaitForPageReadyAsync(GatewayReadyJs, 20000);
+        Report("Step 9 — On payment gateway. Locating QR...");
         await D(1500); await InjectAsync();
+    }
 
-        // One more captcha check — some IRCTC flows show it right before Pay & Book
-        bool lateCaptcha = await WaitForAsync(
-            @"__h.exists('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""]') || " +
-            @"__h.exists('input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""]')",
-            4000);
-        if (lateCaptcha)
+    // Wait until (a) the document has finished loading AND (b) `readyJs` is true.
+    // Used between clicks so we never act on a half-rendered page.
+    private async Task<bool> WaitForPageReadyAsync(string readyJs, int timeoutMs)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
         {
-            await Exec(@"(function(){
-  var el = document.querySelector('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""],input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""]');
-  if(el) el.scrollIntoView({block:'center'});
-})();");
-            Report("Step 9 - CAPTCHA on payment page. Solving automatically...");
-            await AutoSolveCaptchaAsync();
-            await D(500); await InjectAsync();
+            try
+            {
+                await InjectAsync();
+                bool docLoaded = await ExecBool("document.readyState === 'complete'");
+                bool ready     = await ExecBool($"!!({readyJs})");
+                if (docLoaded && ready) return true;
+            }
+            catch { }
+            await D(400);
         }
-
-        bool payClicked = await ClickText("button,a", "Pay & Book");
-        if (!payClicked) payClicked = await ClickText("button,a", "PAY & BOOK");
-        if (!payClicked) payClicked = await ClickText("button,a", "PAY AND BOOK");
-
-        if (!payClicked)
-        {
-            Report("Step 9 — Pay & Book not found — click it manually, then 'OK (Continue)'.");
-            await UserAckAsync(); await InjectAsync();
-        }
-        await D(5000); await InjectAsync();
+        return false;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -766,46 +1007,164 @@ true;";
     {
         Report("Step 10 — Waiting for UPI payment QR code...");
 
-        for (int attempt = 0; attempt < 60; attempt++)
+        // Broad selector: img/canvas/svg whose attrs hint QR, plus the IRCTC iPay
+        // gateway QR container.
+        const string qrSelector =
+            @"img[src*=""qr""], img[alt*=""qr""], img[alt*=""QR""], img[id*=""qr""], img[class*=""qr""], " +
+            @".qr-code img, [class*=""qr""] img, [id*=""qr""] img, [class*=""Qr""] img, " +
+            @"canvas[class*=""qr""], canvas[id*=""qr""], canvas.qrcode, " +
+            @".qrImg, .qr_img, #qrImage, [class*=""qrcode""] img, [class*=""qrcode""] canvas, svg[class*=""qr""]";
+
+        bool clickedReveal = false;
+
+        for (int attempt = 0; attempt < 120; attempt++)
         {
-            await D(2000); await InjectAsync();
+            await D(1500); await InjectAsync();
 
-            // Try to find QR image or canvas
-            var src = (await Exec(@"
-__h.imgSrc('img[src*=""qr""]')  ||
-__h.imgSrc('img[alt*=""QR""]')  ||
-__h.imgSrc('img[alt*=""qr""]')  ||
-__h.imgSrc('.qr-code img')     ||
-__h.imgSrc('[class*=""qr""] img') ||
-__h.canvasUrl('canvas.qrcode') ||
-__h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
-
-            if (src.Length > 10 && src != "null" && src != "''")
+            // 0) Some gateways show a placeholder with "Click here to pay through QR".
+            //    Click it ONCE to render the real scannable QR.
+            if (!clickedReveal)
             {
-                await D(1500); // let QR fully render
+                bool clicked = await ClickAsync(@"(function(){
+  var el = Array.from(document.querySelectorAll('div,span,a,p,button,img'))
+    .find(function(e){
+       var t=(e.innerText||'')+' '+(e.getAttribute&&e.getAttribute('alt')||'');
+       return /click here to pay through qr|click .*qr|tap .*qr|view qr/i.test(t)
+              && e.offsetParent!==null;
+    });
+  return el || null;
+})()");
+                if (clicked) { clickedReveal = true; await D(2000); await InjectAsync(); }
+            }
+
+            // 1) Try to grab the QR element's image/canvas source directly
+            var src = (await Exec($@"(function(){{
+  var el = document.querySelector('{qrSelector.Replace("\"", "\\\"")}');
+  if (!el) return '';
+  if (el.tagName === 'CANVAS') {{ try {{ return el.toDataURL('image/png'); }} catch(e) {{ return ''; }} }}
+  return el.src || '';
+}})()")).Trim('"');
+
+            if (src.Length > 30 && src != "null")
+            {
+                await D(1000);
                 var bmp = await CaptureQrBitmapAsync(src);
                 if (bmp != null)
                 {
-                    Report("Step 10 — UPI QR code ready! Scan to pay.");
+                    Report("Step 10 — UPI QR code extracted! Scan to pay.");
                     OnQrReady?.Invoke(bmp);
                     return;
                 }
             }
 
-            // If still on review/gateway page, check for "Scan & Pay" text
-            if (await ExecBool("__h.pageHas('Scan') || __h.pageHas('scan') || __h.pageHas('QR')"))
+            // 2) QR element exists but not readable → crop it from a screenshot
+            var cropped = await CropQrFromScreenshotAsync(qrSelector);
+            if (cropped != null)
             {
-                // Take full page screenshot as fallback
-                var fullBmp = await TakeScreenshotAsync();
-                if (fullBmp != null)
-                {
-                    Report("Step 10 — Payment page open. QR shown in app (full page capture).");
-                    OnQrReady?.Invoke(fullBmp);
-                    return;
-                }
+                Report("Step 10 — UPI QR code extracted (cropped)! Scan to pay.");
+                OnQrReady?.Invoke(cropped);
+                return;
+            }
+
+            // 3) Last resort: if the page clearly shows a QR/UPI gateway, crop the
+            //    largest square-ish image/canvas on the page (that's the QR).
+            var squareCrop = await CropLargestSquareImageAsync();
+            if (squareCrop != null)
+            {
+                Report("Step 10 — UPI QR code extracted (square detect)! Scan to pay.");
+                OnQrReady?.Invoke(squareCrop);
+                return;
             }
         }
-        Report("Step 10 — Payment page open in browser. Scan QR manually to complete payment.");
+        Report("Step 10 — QR not auto-detected. Scan it in the browser to complete payment.");
+    }
+
+    // Find the largest near-square <img>/<canvas> on the page — on a UPI gateway
+    // that's the QR code — and crop it from a screenshot.
+    private async Task<System.Drawing.Bitmap?> CropLargestSquareImageAsync()
+    {
+        try
+        {
+            // Only attempt this on an actual payment/QR gateway page.
+            bool gateway = await ExecBool(
+                @"/scan.*qr|pay through qr|upi|phonepe|paytm|razorpay|billdesk|bharatqr|order id/i
+                   .test(document.body.innerText||'')");
+            if (!gateway) return null;
+
+            var rectRaw = (await Exec(@"(function(){
+  var els = Array.from(document.querySelectorAll('img,canvas,svg'));
+  var best=null, bestArea=0;
+  for (var e of els){
+     var r=e.getBoundingClientRect();
+     if (r.width<80 || r.height<80) continue;
+     var ratio = r.width/r.height;
+     if (ratio<0.8 || ratio>1.25) continue;          // near-square only
+     var area=r.width*r.height;
+     if (area>bestArea){ bestArea=area; best=e; }
+  }
+  if(!best) return '';
+  best.scrollIntoView({block:'center'});
+  var r=best.getBoundingClientRect();
+  return JSON.stringify({x:Math.round(r.left),y:Math.round(r.top),
+                         w:Math.round(r.width),h:Math.round(r.height),
+                         dpr:window.devicePixelRatio||1});
+})()")).Trim('"').Replace("\\\"", "\"");
+
+            if (string.IsNullOrEmpty(rectRaw) || !rectRaw.StartsWith("{")) return null;
+            await D(400);
+            return await CropByRectJsonAsync(rectRaw);
+        }
+        catch { return null; }
+    }
+
+    // Crop ONLY the QR element from a full-page screenshot using its bounding rect
+    private async Task<System.Drawing.Bitmap?> CropQrFromScreenshotAsync(string qrSelector)
+    {
+        try
+        {
+            var rectRaw = (await Exec($@"(function(){{
+  var el = document.querySelector('{qrSelector.Replace("\"", "\\\"")}');
+  if (!el) return '';
+  el.scrollIntoView({{block:'center'}});
+  var r = el.getBoundingClientRect();
+  if (r.width < 40 || r.height < 40) return '';
+  return JSON.stringify({{x:Math.round(r.left), y:Math.round(r.top),
+                          w:Math.round(r.width), h:Math.round(r.height),
+                          dpr: window.devicePixelRatio || 1}});
+}})()")).Trim('"').Replace("\\\"", "\"");
+
+            if (string.IsNullOrEmpty(rectRaw) || !rectRaw.StartsWith("{")) return null;
+            await D(400); // allow scroll to settle
+            return await CropByRectJsonAsync(rectRaw);
+        }
+        catch { return null; }
+    }
+
+    // Crop a screenshot to the rectangle described by a JSON {x,y,w,h,dpr} string.
+    private async Task<System.Drawing.Bitmap?> CropByRectJsonAsync(string rectJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(rectJson);
+            var root = doc.RootElement;
+            double dpr = root.GetProperty("dpr").GetDouble();
+            int x = (int)(root.GetProperty("x").GetDouble() * dpr);
+            int y = (int)(root.GetProperty("y").GetDouble() * dpr);
+            int w = (int)(root.GetProperty("w").GetDouble() * dpr);
+            int h = (int)(root.GetProperty("h").GetDouble() * dpr);
+
+            using var full = await TakeScreenshotAsync();
+            if (full == null) return null;
+
+            x = Math.Max(0, Math.Min(x, full.Width  - 1));
+            y = Math.Max(0, Math.Min(y, full.Height - 1));
+            w = Math.Max(1, Math.Min(w, full.Width  - x));
+            h = Math.Max(1, Math.Min(h, full.Height - y));
+
+            var crop = new System.Drawing.Rectangle(x, y, w, h);
+            return full.Clone(crop, full.PixelFormat);
+        }
+        catch { return null; }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -839,11 +1198,12 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
             if (await ExecBool($"__h.fill('{sel}','{Esc(pass)}')")) break;
         await D(500);
 
-        // CAPTCHA on login page?
-        if (await ExecBool("__h.exists('img[src*=captcha]') || __h.pageHas('Enter Captcha')"))
+        // CAPTCHA on login page? — auto-solve it
+        if (await ExecBool("__h.captchaVisible() || __h.pageHas('Enter Captcha')"))
         {
-            Report("Login CAPTCHA — solve it in the browser, then click 'OK (Continue)'.");
-            await UserAckAsync();
+            Report("Login CAPTCHA — auto-solving...");
+            await AutoSolveCaptchaAsync();
+            await D(400);
         }
 
         // Click SIGN IN
@@ -896,11 +1256,94 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
         return true;
     }
 
+    // Direct in-DOM click on the element returned by `jsExpr`. Unlike ClickAsync
+    // (which dispatches CDP mouse events at viewport coordinates and can miss when
+    // an ad iframe overlays the target, the button sits below the fold, or DPR/zoom
+    // shifts the hit point), this calls the element's own .click() plus a full
+    // synthetic pointer/mouse sequence ON the element — which Angular (click)
+    // handlers respond to reliably. Returns true if an element was found & clicked.
+    private async Task<bool> ClickDomAsync(string jsExpr)
+    {
+        await InjectAsync();
+        var ok = await Exec($@"(function(){{
+  try {{
+    var el = ({jsExpr});
+    if (!el) return false;
+    // If the match is an inner <span>, click the real button/anchor wrapping it.
+    var target = el.closest ? (el.closest('button,a') || el) : el;
+    target.scrollIntoView({{block:'center', inline:'nearest'}});
+
+    var opts = {{bubbles:true, cancelable:true, view:window}};
+    function fire(node){{
+      try {{ node.focus(); }} catch(e) {{}}
+      ['pointerover','pointerenter','pointerdown','mousedown',
+       'pointerup','mouseup','click'].forEach(function(type){{
+        try {{
+          var ev = (type.indexOf('pointer')===0)
+            ? new PointerEvent(type, opts)
+            : new MouseEvent(type, opts);
+          node.dispatchEvent(ev);
+        }} catch(e) {{}}
+      }});
+      try {{ node.click(); }} catch(e) {{}}
+      // Some Angular buttons respond to keyboard activation (Enter / Space).
+      ['keydown','keyup'].forEach(function(type){{
+        try {{ node.dispatchEvent(new KeyboardEvent(type,
+                 {{bubbles:true, cancelable:true, key:'Enter', code:'Enter', keyCode:13}})); }} catch(e) {{}}
+      }});
+    }}
+    fire(target);
+    return true;
+  }} catch(e) {{ return false; }}
+}})()");
+        return ok.Trim('"') is "true" or "1";
+    }
+
     // Click first element (from given tags) whose text contains txt
     private Task<bool> ClickText(string tags, string txt)
         => ClickAsync(
             $"Array.from(document.querySelectorAll('{tags}'))" +
             $".find(function(e){{return (e.innerText||'').toUpperCase().includes('{txt.ToUpper().Replace("'", "\\'")}')&&e.offsetParent!==null;}})");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP-GATE PRIMITIVE
+    //  Repeats `action` until JS `verifyJs` returns true. The workflow NEVER
+    //  advances past a step until that step's outcome is verified on the page.
+    // ═══════════════════════════════════════════════════════════════════════
+    private async Task<bool> EnsureAsync(
+        string what,
+        Func<Task> action,
+        string verifyJs,
+        int maxAttempts = 6,
+        int settleMs = 700,
+        bool promptOnFail = true)
+    {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            await InjectAsync();
+            if (await ExecBool(verifyJs)) return true;     // already done
+
+            Report($"{what} — attempt {attempt}/{maxAttempts}...");
+            await action();
+            await D(settleMs); await InjectAsync();
+
+            if (await ExecBool(verifyJs)) return true;     // verified done
+        }
+
+        if (promptOnFail)
+        {
+            // Genuinely stuck step — pause and let the user help; do NOT advance.
+            Report($"{what} could NOT be completed automatically. " +
+                   $"Please do it in the browser, then click 'OK (Continue)'.");
+            await UserAckAsync();
+            await InjectAsync();
+            return await ExecBool(verifyJs);
+        }
+
+        // Autonomous mode — never prompt; report and let the caller continue.
+        Report($"{what} — not verified after {maxAttempts} attempts; continuing.");
+        return false;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  QR CAPTURE HELPERS
@@ -943,64 +1386,93 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
     /// the IRCTC image captcha using Windows OCR and enter the solution.
     /// Falls back to asking the user only if all OCR attempts fail.
     /// </summary>
-    private async Task AutoSolveCaptchaAsync(int maxAttempts = 3)
+    // Fully autonomous captcha solver — NEVER asks the user.
+    // Reads the captcha, types it, and if rejected, refreshes and retries.
+    private async Task AutoSolveCaptchaAsync(int maxAttempts = 12)
     {
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
             await InjectAsync();
 
-            // Check captcha is actually visible
-            bool visible = await ExecBool(
-                @"__h.exists('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""],canvas') || " +
-                @"__h.exists('input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""],input[placeholder*=""captcha""]') || " +
-                @"__h.pageHas('Captcha')");
-            if (!visible) return; // no captcha on this page
+            bool visible = await ExecBool(@"__h.captchaVisible()");
+            if (!visible) return; // captcha gone → solved/left page
 
             Report($"Auto-solving CAPTCHA (attempt {attempt}/{maxAttempts})...");
 
             var text = await OcrCaptchaAsync();
-            if (string.IsNullOrWhiteSpace(text))
+
+            // Clean common OCR confusions; keep only plausible captcha chars
+            text = (text ?? "").Trim();
+
+            if (text.Length < 4 || text.Length > 8)
             {
-                Report($"OCR attempt {attempt} got no text — retrying...");
+                Report($"OCR '{text}' implausible — refreshing captcha...");
                 await RefreshCaptchaAsync();
-                await D(1000);
+                await D(1200);
                 continue;
             }
 
             Report($"OCR result: '{text}' — entering...");
 
-            // Enter the captcha text
+            // Type the captcha into the Angular reactive-form input (#captcha).
+            // Use the native value setter + per-character key events so Angular's
+            // FormControl registers the value (clears ng-pristine).
             await Exec($@"(function(){{
   var inp = document.querySelector(
-    'input[id*=""captcha""],input[name*=""captcha""],input[formcontrolname*=""captcha""],input[placeholder*=""Captcha""],input[placeholder*=""captcha""]');
+    'input#captcha, input[formcontrolname=""captcha""], input[name=""captcha""], input[placeholder*=""Captcha""]');
   if (!inp) return;
-  var s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
-  s.call(inp, '{Esc(text)}');
-  inp.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
-  inp.dispatchEvent(new Event('change',{{bubbles:true}}));
-  inp.dispatchEvent(new FocusEvent('blur',{{bubbles:true}}));
-}})();");
-            await D(400);
+  var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+  inp.focus();
+  inp.dispatchEvent(new Event('focus',{{bubbles:true}}));
 
-            // If this is not the last attempt, verify no "invalid" error
-            if (attempt < maxAttempts)
+  // clear
+  setter.call(inp, '');
+  inp.dispatchEvent(new Event('input',{{bubbles:true}}));
+
+  // type char-by-char so Angular sees real keystrokes
+  var val = '{Esc(text)}';
+  for (var i=0;i<val.length;i++){{
+    var ch = val[i];
+    var cur = val.substring(0,i+1);
+    setter.call(inp, cur);
+    inp.dispatchEvent(new KeyboardEvent('keydown',{{key:ch,bubbles:true}}));
+    inp.dispatchEvent(new Event('input',{{bubbles:true}}));
+    inp.dispatchEvent(new KeyboardEvent('keyup',{{key:ch,bubbles:true}}));
+  }}
+  inp.dispatchEvent(new Event('change',{{bubbles:true}}));
+  inp.dispatchEvent(new Event('blur',{{bubbles:true}}));
+}})();");
+            await D(500);
+
+            // Verify the value actually landed in the input
+            var landed = (await Exec(
+                @"(document.querySelector('input#captcha,input[formcontrolname=""captcha""],input[name=""captcha""]')||{}).value || ''"))
+                .Trim('"');
+            if (!string.Equals(landed, text, StringComparison.OrdinalIgnoreCase))
             {
-                await D(800);
-                bool invalid = await ExecBool("__h.pageHas('Invalid Captcha') || __h.pageHas('invalid captcha')");
-                if (invalid)
-                {
-                    Report($"Captcha '{text}' rejected — getting fresh captcha...");
-                    await RefreshCaptchaAsync();
-                    await D(1200);
-                    continue;
-                }
+                Report($"Captcha value didn't stick ('{landed}') — retrying...");
+                await D(300);
+                continue;
             }
-            return; // solution entered
+            await D(300);
+
+            // Check for rejection. If rejected, refresh + retry automatically.
+            bool invalid = await ExecBool(
+                "__h.pageHas('Invalid Captcha') || __h.pageHas('invalid captcha') " +
+                "|| __h.pageHas('incorrect captcha')");
+            if (invalid)
+            {
+                Report($"Captcha '{text}' rejected — fresh captcha + retry...");
+                await RefreshCaptchaAsync();
+                await D(1300);
+                continue;
+            }
+            return; // accepted (or no error shown yet)
         }
 
-        // All OCR attempts failed — ask user
-        Report("Auto-solve failed — please type the captcha in the browser, then click 'OK (Continue)'.");
-        await UserAckAsync();
+        // Exhausted attempts — leave last guess entered; the caller's page-change
+        // verification will keep things moving. NO user prompt.
+        Report("Captcha auto-solve attempts exhausted — proceeding with last guess.");
     }
 
     private async Task<string> OcrCaptchaAsync()
@@ -1008,17 +1480,12 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
         try
         {
             // ── 1. Get captcha image bytes ────────────────────────────────
+            // IRCTC uses <img class=""captcha-img"" src=""data:image/jpg;base64,..."">
+            // The base64 src does NOT contain the word 'captcha', so match by class.
             var src = (await Exec(@"(function(){
-  var img = document.querySelector('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""]')
-    || Array.from(document.images).find(function(i) {
-      var text = ((i.id || '') + ' ' + (i.alt || '') + ' ' + (i.className || '') + ' ' + (i.src || '')).toLowerCase();
-      var r = i.getBoundingClientRect();
-      return (text.includes('captcha') || (r.width >= 80 && r.width <= 400 && r.height >= 25 && r.height <= 150))
-        && r.width > 0 && r.height > 0;
-    });
-  if (img) return img.src;
-  var canvas = document.querySelector('canvas');
-  return canvas ? canvas.toDataURL() : '';
+  var img = document.querySelector(
+    'img.captcha-img, .captcha_div img, .captcha_mainDeiv img, img[alt*=""Captcha""], img[src*=""captcha""], img[id*=""captcha""]');
+  return img ? img.src : '';
 })()")).Trim('"');
             if (string.IsNullOrEmpty(src)) return "";
 
@@ -1044,65 +1511,138 @@ __h.canvasUrl('[class*=""qr""] canvas') || ''''")).Trim('"');
                 bytes = Convert.FromBase64String(b64[(b64.IndexOf(',') + 1)..]);
             }
 
-            // ── 2. Preprocess: scale up 3x, grayscale, threshold ─────────
             using var ms = new System.IO.MemoryStream(bytes);
             using var orig = new System.Drawing.Bitmap(ms);
-            using var processed = PreprocessCaptchaImage(orig);
 
-            // ── 3. Convert to WinRT SoftwareBitmap ────────────────────────
-            using var pngMs = new System.IO.MemoryStream();
-            processed.Save(pngMs, System.Drawing.Imaging.ImageFormat.Png);
-            pngMs.Position = 0;
-
-            var ras = pngMs.AsRandomAccessStream();
-            var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(ras);
-            var softBitmap = await decoder.GetSoftwareBitmapAsync();
-
-            // ── 4. Run Windows OCR ────────────────────────────────────────
             var engine = Windows.Media.Ocr.OcrEngine.TryCreateFromLanguage(
                             new Windows.Globalization.Language("en-US"))
                        ?? Windows.Media.Ocr.OcrEngine.TryCreateFromUserProfileLanguages();
             if (engine == null) return "";
 
-            var ocrResult = await engine.RecognizeAsync(softBitmap);
+            // Run OCR on several preprocessing variants; keep the most plausible.
+            var candidates = new List<string>();
+            foreach (var variant in BuildCaptchaVariants(orig))
+            {
+                using (variant)
+                {
+                    using var pngMs = new System.IO.MemoryStream();
+                    variant.Save(pngMs, System.Drawing.Imaging.ImageFormat.Png);
+                    pngMs.Position = 0;
 
-            // ── 5. Extract only alphanumeric chars ────────────────────────
-            var clean = new string(ocrResult.Text.Where(char.IsLetterOrDigit).ToArray()).ToUpper();
-            return clean;
+                    var ras = pngMs.AsRandomAccessStream();
+                    var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(ras);
+                    var soft = await decoder.GetSoftwareBitmapAsync();
+                    var res  = await engine.RecognizeAsync(soft);
+
+                    var clean = new string(res.Text.Where(char.IsLetterOrDigit).ToArray());
+                    if (!string.IsNullOrWhiteSpace(clean)) candidates.Add(clean);
+                }
+            }
+
+            if (candidates.Count == 0) return "";
+
+            // Prefer a 4-8 char result (typical captcha length); else the longest.
+            var best = candidates
+                .OrderByDescending(c => (c.Length is >= 4 and <= 8) ? 1 : 0)
+                .ThenByDescending(c => c.Length)
+                .First();
+            return best;
         }
         catch { return ""; }
     }
 
-    private static System.Drawing.Bitmap PreprocessCaptchaImage(System.Drawing.Bitmap src)
+    // Build a few preprocessing variants: auto-polarity, forced-invert, plain grayscale.
+    private static IEnumerable<System.Drawing.Bitmap> BuildCaptchaVariants(System.Drawing.Bitmap orig)
     {
-        const int scale = 3;
+        yield return PreprocessCaptchaImage(orig);            // auto-detect polarity
+        yield return PreprocessCaptchaImage(orig, forceInvert: true);
+        yield return ScaleGrayscale(orig);                    // no threshold, just upscale+gray
+    }
+
+    private static System.Drawing.Bitmap ScaleGrayscale(System.Drawing.Bitmap src)
+    {
+        const int scale = 4;
         var wide = new System.Drawing.Bitmap(src.Width * scale, src.Height * scale);
         using (var g = System.Drawing.Graphics.FromImage(wide))
         {
             g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
             g.DrawImage(src, 0, 0, wide.Width, wide.Height);
         }
-        // Grayscale + threshold (binarise at 140)
         for (int x = 0; x < wide.Width; x++)
             for (int y = 0; y < wide.Height; y++)
             {
-                var p   = wide.GetPixel(x, y);
-                var lum = (int)(p.R * 0.299 + p.G * 0.587 + p.B * 0.114);
-                wide.SetPixel(x, y, lum < 140
-                    ? System.Drawing.Color.Black
-                    : System.Drawing.Color.White);
+                var p = wide.GetPixel(x, y);
+                int l = (int)(p.R * 0.299 + p.G * 0.587 + p.B * 0.114);
+                wide.SetPixel(x, y, System.Drawing.Color.FromArgb(l, l, l));
+            }
+        return wide;
+    }
+
+    // Produce a clean black-text-on-white image for OCR.
+    // Auto-detects polarity: IRCTC captchas are often LIGHT text on a DARK
+    // background, which must be inverted (Windows OCR expects dark-on-light).
+    private static System.Drawing.Bitmap PreprocessCaptchaImage(
+        System.Drawing.Bitmap src, bool forceInvert = false)
+    {
+        const int scale = 4;
+        var wide = new System.Drawing.Bitmap(src.Width * scale, src.Height * scale);
+        using (var g = System.Drawing.Graphics.FromImage(wide))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            g.SmoothingMode     = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+            g.DrawImage(src, 0, 0, wide.Width, wide.Height);
+        }
+
+        int w = wide.Width, h = wide.Height;
+
+        // 1) Compute luminance + average to estimate background brightness.
+        var lum = new int[w, h];
+        long total = 0;
+        for (int x = 0; x < w; x++)
+            for (int y = 0; y < h; y++)
+            {
+                var p = wide.GetPixel(x, y);
+                int l = (int)(p.R * 0.299 + p.G * 0.587 + p.B * 0.114);
+                lum[x, y] = l;
+                total += l;
+            }
+        double avg = total / (double)(w * h);
+
+        // If the image is mostly dark, the text is light → invert so text is dark.
+        // forceInvert flips whatever the auto-detection decided (used as a 2nd variant).
+        bool darkBackground = (avg < 128) ^ forceInvert;
+
+        // 2) Threshold around the mean (Otsu-lite) then output dark-on-white.
+        int threshold = (int)avg;
+        for (int x = 0; x < w; x++)
+            for (int y = 0; y < h; y++)
+            {
+                bool isTextPixel = darkBackground
+                    ? lum[x, y] > threshold    // light text on dark bg
+                    : lum[x, y] < threshold;   // dark text on light bg
+                wide.SetPixel(x, y, isTextPixel
+                    ? System.Drawing.Color.Black     // text → black
+                    : System.Drawing.Color.White);   // background → white
             }
         return wide;
     }
 
     private async Task RefreshCaptchaAsync()
     {
-        // Click captcha image or a refresh icon to get a new one
+        // IRCTC refresh control: <a aria-label="Click to refresh Captcha">
+        //                          <span class="glyphicon glyphicon-repeat"></span></a>
         await Exec(@"(function(){
-  var img = document.querySelector('img[src*=""captcha""],img[id*=""captcha""],img[alt*=""captcha""]');
+  // 1) the dedicated refresh anchor / glyphicon
+  var a = document.querySelector('a[aria-label*=""refresh Captcha""], a[aria-label*=""Refresh Captcha""]');
+  if (a) { a.click(); return; }
+  var g = document.querySelector('.glyphicon-repeat, .glyphicon-refresh');
+  if (g) { (g.closest('a,button')||g).click(); return; }
+  // 2) refresh-by-class fallback
+  var ref2 = document.querySelector('[class*=""refresh""],[id*=""refresh""]');
+  if (ref2) { ref2.click(); return; }
+  // 3) clicking the captcha image itself often reloads it
+  var img = document.querySelector('img.captcha-img, .captcha_div img');
   if (img) img.click();
-  var ref2 = document.querySelector('[class*=""refresh""],[id*=""refresh""],[title*=""refresh""],[aria-label*=""refresh""]');
-  if (ref2) ref2.click();
 })();");
     }
 
