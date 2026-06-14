@@ -85,7 +85,7 @@ true;";
             // ── Step 1 — Open IRCTC and search (NO login yet) ─────────────
             Report("Step 1 — Opening IRCTC...");
             await NavAsync("https://www.irctc.co.in/nget/train-search");
-            await D(4000); await InjectAsync();
+            await D(1500); await InjectAsync();   // NavAsync already awaited load
 
             await Step1_SearchAsync(booking);           // search with saved filters
 
@@ -125,11 +125,12 @@ true;";
 
         // From station
         await ClickAsync("document.querySelectorAll('p-autocomplete input')[0]");
-        await D(300);
+        await D(250);
         await Exec($"__h.fill('p-autocomplete input', '{Esc(b.FromCode)}')");
-        await D(1800);
+        // wait for the autocomplete list to populate (polls, not a fixed sleep)
+        await WaitForAsync("__h.exists('.ui-autocomplete-list-item, li.p-autocomplete-item, li.ui-corner-all')", 3000);
         await ClickAsync("document.querySelector('.ui-autocomplete-list-item, li.p-autocomplete-item, li.ui-corner-all')");
-        await D(700);
+        await D(400);
 
         // To station
         await Exec($@"(function(){{
@@ -140,9 +141,9 @@ true;";
   s.call(inp,'{Esc(b.ToCode)}');
   inp.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
 }})();");
-        await D(1800);
+        await WaitForAsync("__h.exists('.ui-autocomplete-list-item, li.p-autocomplete-item')", 3000);
         await ClickAsync("document.querySelector('.ui-autocomplete-list-item, li.p-autocomplete-item')");
-        await D(700);
+        await D(400);
 
         // Date
         var dp = b.JourneyDate.Split('-');
@@ -172,7 +173,9 @@ true;";
         // Click Search
         Report("Step 1 — Clicking Search Trains...");
         await ClickText("button", "SEARCH");
-        await D(7000); await InjectAsync();
+        // results load via AJAX; Step 2 polls for the train list, so a short
+        // settle is enough here (was a flat 7s).
+        await D(2000); await InjectAsync();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -265,7 +268,7 @@ true;";
             Report("Book Now not found — click it manually, then 'OK (Continue)'.");
             await UserAckAsync(); await InjectAsync();
         }
-        await D(1500); await InjectAsync();
+        await D(800); await InjectAsync();
 
         // Step 4 — handle date/station confirmation dialog
         bool confirm = await WaitForAsync(
@@ -274,7 +277,7 @@ true;";
         {
             Report("Step 4 — Confirmation dialog: clicking Yes...");
             await ClickText("button", "YES");
-            await D(2000); await InjectAsync();
+            await D(1000); await InjectAsync();
         }
     }
 
@@ -284,7 +287,7 @@ true;";
     private async Task Step5_ReLoginAsync()
     {
         Report("Step 5 — Checking for re-login prompt...");
-        await D(2000); await InjectAsync();
+        await D(1000); await InjectAsync();
 
         bool needLogin = await WaitForAsync(
             @"__h.exists('input[placeholder=""User Name""]') || " +
@@ -295,7 +298,7 @@ true;";
         {
             Report("Step 5 — Re-login required. Logging in automatically...");
             await LoginAsync(_lastUser, _lastPass);
-            await D(3000); await InjectAsync();
+            await D(1500); await InjectAsync();
         }
 
         // Confirm we reached the passenger form
@@ -314,7 +317,7 @@ true;";
     private async Task Step6_PassengersAsync(SavedBooking b)
     {
         Report("Step 6 — Filling passenger details...");
-        await D(1500); await InjectAsync();
+        await D(800); await InjectAsync();
 
         for (int i = 0; i < b.Passengers.Count; i++)
         {
@@ -390,19 +393,19 @@ true;";
 
         // ── Continue Booking → leads to the PAYMENT-METHOD page ────────────
         // (BHIM/UPI selection happens on that next page, not here.)
-        Report("Step 6 — Passenger details verified. Clicking Continue Booking...");
-        await EnsureAsync(
-            "Continue Booking → payment page",
-            async () => {
-                bool c = await ClickText("button", "Continue Booking");
-                if (!c) c = await ClickText("button", "CONTINUE");
-                if (!c) await ClickText("button", "Continue");
-            },
-            // verified once the payment-method page is showing the BHIM/UPI option
-            @"__h.pageHas('Pay through BHIM') || __h.pageHas('BHIM/UPI')
+        // CLICK ONCE ONLY — IRCTC rejects double-clicks. Then poll for the page.
+        const string onPaymentPageJs = @"__h.pageHas('Pay through BHIM') || __h.pageHas('BHIM/UPI')
               || __h.pageHas('Convenience Fee')
-              || (__h.pageHas('Pay through') && document.querySelectorAll('input[type=""radio""]').length>0)",
-            maxAttempts: 5, settleMs: 2500);
+              || (__h.pageHas('Pay through') && document.querySelectorAll('input[type=""radio""]').length>0)";
+
+        Report("Step 6 — Passenger details verified. Clicking Continue Booking...");
+        if (!await ExecBool(onPaymentPageJs))
+        {
+            bool c = await ClickText("button", "Continue Booking");
+            if (!c) c = await ClickText("button", "CONTINUE");
+            if (!c) await ClickText("button", "Continue");
+            await WaitForAsync(onPaymentPageJs, 15000);   // single click → wait
+        }
 
         await D(1200); await InjectAsync();
     }
@@ -649,14 +652,10 @@ true;";
             Report($"Step 6b — Re-selecting BHIM/UPI ({i + 1}/4)...");
         }
 
-        // 2) Click Continue — ALWAYS attempt, regardless of verify result above.
-        //    Verified by the payment page actually changing.
-        Report("Step 6b — Clicking Continue...");
-        await EnsureAsync(
-            "Step 6b — Continue after payment selection",
-            async () => {
-                // Re-assert UPI radio right before each Continue attempt
-                await Exec(@"(function(){
+        // 2) Re-assert the UPI radio, then click Continue EXACTLY ONCE and wait.
+        //    IRCTC rejects double-clicks ("Sorry!! Please Try again"), so we must
+        //    NOT retry the Continue click — click once, then poll for progress.
+        await Exec(@"(function(){
   var r = Array.from(document.querySelectorAll('input[type=""radio""]')).find(function(x){
     var v=(x.value||x.id||'').toLowerCase();
     var lbl=document.querySelector('label[for=""'+x.id+'""]');
@@ -666,15 +665,24 @@ true;";
   if(r && !r.checked){ r.checked=true; r.click();
                        r.dispatchEvent(new Event('change',{bubbles:true})); }
 })();");
-                await D(250);
+        await D(250);
 
-                // Click the Continue button precisely (button / anchor / bar).
-                bool c = await ClickAsync(@"(function(){
+        const string leftPaymentMethodJs = @"__h.captchaVisible() || __h.pageHas('Enter Captcha')
+              || Array.from(document.querySelectorAll('button,a')).some(function(b){
+                   var t=(b.innerText||'').toUpperCase();
+                   return t.includes('PAY')&&t.includes('BOOK');
+                 })
+              || /scan|qr code/i.test(document.body.innerText||'')
+              || !__h.pageHas('Convenience Fee')";
+
+        Report("Step 6b — Clicking Continue (once)...");
+        if (!await ExecBool(leftPaymentMethodJs))
+        {
+            bool c = await ClickAsync(@"(function(){
   var cands = Array.from(document.querySelectorAll('button,a,span,div'))
     .filter(function(e){
        var t=(e.innerText||'').trim().toUpperCase();
-       return t==='CONTINUE' && e.offsetParent!==null
-              && !e.disabled;
+       return t==='CONTINUE' && e.offsetParent!==null && !e.disabled;
     })
     .sort(function(a,b){
        var ab=(a.tagName==='BUTTON'||a.tagName==='A')?0:1;
@@ -684,18 +692,10 @@ true;";
     });
   return cands[0] || null;
 })()");
-                if (!c) c = await ClickText("button", "CONTINUE");
-                if (!c) await ClickText("button,a", "Continue");
-            },
-            // left the payment-method page → captcha, review, Pay&Book, or QR shown
-            @"__h.captchaVisible() || __h.pageHas('Enter Captcha')
-              || Array.from(document.querySelectorAll('button,a')).some(function(b){
-                   var t=(b.innerText||'').toUpperCase();
-                   return t.includes('PAY')&&t.includes('BOOK');
-                 })
-              || /scan|qr code/i.test(document.body.innerText||'')
-              || !__h.pageHas('Convenience Fee')",
-            maxAttempts: 6, settleMs: 2500, promptOnFail: false);
+            if (!c) c = await ClickText("button", "CONTINUE");
+            if (!c) await ClickText("button,a", "Continue");
+            await WaitForAsync(leftPaymentMethodJs, 15000);   // single click → wait
+        }
 
         await D(1200); await InjectAsync();
     }
@@ -730,76 +730,46 @@ true;";
     private async Task Step8_ContinueToReviewAsync()
     {
         // ── 8a) Review/Fare Summary page → Continue ───────────────────────
-        // Verified when we land on the Payment Methods page (BHIM/UPI/USSD tile).
-        await EnsureAsync(
-            "Step 8a — Review page → Continue",
-            async () => {
-                // re-solve captcha if it's still showing (wrong previous guess)
-                if (await ExecBool(@"__h.captchaVisible()"))
-                {
-                    await RefreshCaptchaAsync(); await D(1000);
-                    await AutoSolveCaptchaAsync(3); await D(400);
-                }
-                await ClickContinueAsync();
-            },
-            @"(function(){
+        // CRITICAL: IRCTC rejects the booking ("Sorry!! Please Try again" — reason:
+        // "double clicked on any options/buttons") if Continue is clicked more than
+        // once. So we click EXACTLY ONCE, then WAIT (poll) for the Payment Methods
+        // page — we never re-click. Solve captcha first if it's still up.
+        const string onPaymentMethodsTextJs = @"(function(){
    if (__h.captchaVisible()) return false;
    var t=(document.body.innerText||'').toUpperCase();
-   // Payment Methods page shows these option tiles:
    return t.includes('PAYMENT METHODS')
        || t.includes('BHIM/ UPI/ USSD') || t.includes('BHIM/UPI/USSD')
        || t.includes('IRCTC IPAY')
        || t.includes('MULTIPLE PAYMENT SERVICE');
-})()",
-            maxAttempts: 8, settleMs: 2800, promptOnFail: false);
+})()";
 
-        await D(1000); await InjectAsync();
+        if (await ExecBool(@"__h.captchaVisible()"))
+        {
+            await AutoSolveCaptchaAsync(3); await D(400);
+        }
 
-        // ── 8b) Payment Methods page → select 'BHIM/UPI/USSD' tile ────────
-        Report("Step 8b — Selecting 'BHIM/ UPI/ USSD' payment method...");
-        await EnsureAsync(
-            "Step 8b — Select BHIM/UPI/USSD tile",
-            async () => {
-                // Click the row/tile whose text contains BHIM/UPI/USSD
-                bool c = await ClickAsync(@"(function(){
-  var rows = Array.from(document.querySelectorAll('div,li,label,a,span,td'))
-    .filter(function(e){
-       var t=(e.innerText||'').toUpperCase();
-       return (t.includes('BHIM')&&t.includes('UPI')) && e.offsetParent!==null
-              && t.length<80;   // the tile, not a big container
-    })
-    .sort(function(a,b){ return a.innerText.length-b.innerText.length; });
-  return rows[0]||null;
-})()");
-                // also tick any radio inside that tile
-                await Exec(@"(function(){
-  var rows = Array.from(document.querySelectorAll('div,li,label')).filter(function(e){
-     var t=(e.innerText||'').toUpperCase();
-     return t.includes('BHIM')&&t.includes('UPI')&&t.length<120;
-  });
-  for (var r of rows){
-     var radio=r.querySelector('input[type=radio]');
-     if(radio && !radio.checked){ radio.checked=true; radio.click();
-        radio.dispatchEvent(new Event('change',{bubbles:true})); }
-  }
-})();");
-            },
-            // verified when the tile is selected (highlighted) OR page advanced
-            @"(function(){
-   var sel = Array.from(document.querySelectorAll('input[type=radio]')).some(function(x){
-      var row=x.closest('div,li,label');
-      return x.checked && row && /bhim.*upi|upi.*bhim/i.test(row.innerText||'');
-   });
-   // or an active/highlighted tile
-   var tile = Array.from(document.querySelectorAll('[class*=active],[class*=selected],[class*=highlight]'))
-      .some(function(e){ return /bhim.*upi|upi.*bhim/i.test(e.innerText||''); });
-   return sel || tile;
-})()",
-            maxAttempts: 5, settleMs: 800, promptOnFail: false);
+        if (!await ExecBool(onPaymentMethodsTextJs))
+        {
+            Report("Step 8a — Clicking Continue (once) on Review page...");
+            await ClickContinueAsync();
+            // Single click only — then poll for the next page. No re-clicking.
+            await WaitForAsync(onPaymentMethodsTextJs, 15000);
+        }
 
-        // NOTE: Clicking Continue → Pay & Book → gateway is owned entirely by
-        // Step 9 now (so there's a single, load-gated sequence instead of two
-        // competing ones). Step 8 ends once BHIM/UPI/USSD is selected.
+        await D(400); await InjectAsync();
+
+        // ── 8b) → Click "Continue" on the Payment Methods page ────────────────
+        // Wait for the Continue button to exist, clear any notification popup that
+        // could be covering it, then click it.
+        Report("Step 8b — Waiting for Continue button...");
+        await WaitForAsync($"!!({ContinueBtnJs})", 15000);
+        await DismissPopupsAsync();
+
+        Report("Step 8b — Clicking Continue on Payment Methods page...");
+        bool dom = await ClickDomAsync(ContinueBtnJs);
+        bool cdp = dom || await ClickAsync(ContinueBtnJs);
+        Report($"Step 8b — clicked Continue (dom={dom}, cdp={cdp})");
+
         await D(1200); await InjectAsync();
     }
 
@@ -893,6 +863,26 @@ true;";
       /scan.*qr|qr.*scan|click here to pay|upi.*qr|phonepe|paytm|razorpay|billdesk|payment gateway|bharatqr|order id/i
         .test(document.body.innerText||'')";
 
+    // true when IRCTC has bounced the booking to its error/logout page
+    // ('Sorry!! please Try Again !!!' / 'To login click here'). When this shows,
+    // the session/transaction was rejected — no QR will ever appear, so we must
+    // stop instead of waiting at Step 10 forever.
+    private const string BookingFailedJs = @"(function(){
+      var t=(document.body.innerText||'').toLowerCase();
+      return (t.includes('please try again') || t.includes('sorry'))
+          && (t.includes('to login') || t.includes('click here'));
+    })()";
+
+    // true while we are STILL on the Payment Methods page (heading + BHIM/UPI/USSD
+    // tile). Needed because a 'Pay & Book' button is ALSO present on this page (the
+    // desktop body button), so 'Pay & Book exists' can NOT be used to detect that
+    // we left it — that made Step 9a think it was already done and skip Continue.
+    private const string OnPaymentMethodsJs = @"(function(){
+      var t=(document.body.innerText||'').toUpperCase();
+      return t.includes('PAYMENT METHODS')
+          && (t.includes('BHIM/ UPI/ USSD') || t.includes('BHIM/UPI/USSD'));
+    })()";
+
     // Report the visible action buttons currently on the page — turns a silent
     // race into hard data in the status log so we can see what Step 9 is seeing.
     private async Task ReportButtonsAsync(string tag)
@@ -907,77 +897,101 @@ true;";
         Report($"{tag} — visible buttons: {info}");
     }
 
+    // Deep probe of the CONTINUE button: does it exist at all, does __vis pass,
+    // how many client rects, is any ancestor display:none. Pins down exactly why
+    // the click branch is or isn't taken — no more guessing about hidden-* classes.
+    private async Task ProbeContinueAsync()
+    {
+        var info = (await Exec(@"(function(){" + VisibleBtnTest + @"
+  var all = Array.from(document.querySelectorAll('button,a'))
+    .filter(function(b){ return (b.innerText||'').trim().toUpperCase()==='CONTINUE'; });
+  if(all.length===0) return 'CONTINUE: none in DOM';
+  var b = all[0];
+  var rects = b.getClientRects().length;
+  var vis = __vis(b);
+  var hiddenAnc='none';
+  for(var p=b.parentElement;p;p=p.parentElement){
+    if(getComputedStyle(p).display==='none'){ hiddenAnc=(p.tagName+'.'+(p.className||'').split(' ')[0]); break; }
+  }
+  return 'CONTINUE count='+all.length+' vis='+vis+' clientRects='+rects+' hiddenAncestor='+hiddenAnc;
+})()")).Trim('"');
+        Report($"Step 9 — {info}");
+    }
+
+    // Dismiss overlays that intercept clicks — chiefly the web-push
+    // "Click on allow to subscribe to notifications" prompt (TrueNotify/izooto),
+    // which sits ON TOP of the page and swallows the Continue click. We click its
+    // 'Later'/'No thanks'/close control. Returns true if something was dismissed.
+    private async Task<bool> DismissPopupsAsync()
+    {
+        await InjectAsync();
+        bool dismissed = await ExecBool(@"(function(){
+  var hit = false;
+
+  // 1) Notification-permission prompts: a button reading Later / No thanks / Deny / Maybe later.
+  var btns = Array.from(document.querySelectorAll('button,a,span,div'));
+  var dismiss = btns.find(function(e){
+     var t=(e.innerText||'').trim().toLowerCase();
+     return (t==='later' || t==='no thanks' || t==='no, thanks' || t==='maybe later'
+             || t==='deny' || t==='not now' || t==='dismiss')
+            && e.offsetParent!==null && t.length<20;
+  });
+  if(dismiss){ try{ dismiss.click(); hit=true; }catch(e){} }
+
+  // 2) izooto / truenotify / push overlays by id/class.
+  var killSel = '[id*=""izooto""],[class*=""izooto""],[id*=""truenotify""],'
+              + '[class*=""truenotify""],[id*=""onesignal""],[class*=""push""][class*=""prompt""]';
+  Array.from(document.querySelectorAll(killSel)).forEach(function(el){
+     try{ el.style.display='none'; el.style.pointerEvents='none'; hit=true; }catch(e){}
+  });
+
+  // 3) PrimeNG toast / dialog (e.g. the pink 'Info: undefined' box) — click its
+  //    close icon so it stops covering the page / action buttons.
+  var closers = Array.from(document.querySelectorAll(
+     '.ui-toast-close-icon, .p-toast-icon-close, .ui-dialog-titlebar-close, '
+   + '.p-dialog-header-close, [class*=""toast""] [class*=""close""], '
+   + '[class*=""close-icon""]'));
+  closers.forEach(function(el){
+     if(el.offsetParent!==null){ try{ el.click(); hit=true; }catch(e){} }
+  });
+
+  return hit;
+})()");
+        if (dismissed) { Report("Step 9 — dismissed a popup/overlay."); await D(500); await InjectAsync(); }
+        return dismissed;
+    }
+
     private async Task Step9_PayAndBookAsync()
     {
         await InjectAsync();
-        await ReportButtonsAsync("Step 9");
 
-        // ── 9a) Click "Continue" on the Payment Methods page ──────────────────
-        // (Only if a Continue button is present — some variants skip straight to
-        //  the Pay & Book page.)
-        bool hasContinue = await WaitForAsync($"!!({ContinueBtnJs})", 8000);
-        Report($"Step 9a — Continue button present: {hasContinue}");
-        if (hasContinue)
-        {
-            // BLOCKING: we must not proceed until Continue actually advances the
-            // page. If the click can't be made to register automatically, pause and
-            // ask the user to press Continue rather than silently racing to Step 10.
-            bool advanced = await EnsureAsync(
-                "Step 9a — Continue → Pay & Book page",
-                async () => {
-                    bool dom = await ClickDomAsync(ContinueBtnJs);
-                    bool cdp = dom || await ClickAsync(ContinueBtnJs);
-                    Report($"Step 9a — clicked Continue (dom={dom}, cdp={cdp})");
-                },
-                // verified only when we've LEFT the Payment Methods page: a Pay & Book
-                // button appears, or the gateway is reached. (A still-present Continue
-                // means nothing happened.)
-                $"!!({PayBookBtnJs}) || ({GatewayReadyJs})",
-                maxAttempts: 6, settleMs: 3000, promptOnFail: true);
+        // Continue was clicked in Step 8b → the Pay & Book page needs a moment to
+        // load. Wait for the button to actually exist before clicking it (clicking
+        // before it renders is why it "didn't click"). Clear any notification popup
+        // that could be sitting on top of the button, then click it.
+        Report("Step 9 — Waiting for Pay & Book button...");
+        await WaitForAsync($"!!({PayBookBtnJs})", 15000);
+        await DismissPopupsAsync();
 
-            if (!advanced)
-            {
-                Report("Step 9a — Continue did not advance the page. " +
-                       "Please press 'Continue' in the browser, then click 'OK (Continue)'.");
-                await UserAckAsync();
-            }
+        Report("Step 9 — Clicking Pay & Book...");
+        bool dom = await ClickDomAsync(PayBookBtnJs);
+        //bool cdp = dom || await ClickAsync(PayBookBtnJs);
+        Report($"Step 9 — clicked Pay & Book");
 
-            await WaitForPageReadyAsync($"!!({PayBookBtnJs}) || ({GatewayReadyJs})", 12000);
-            await InjectAsync();
-            await ReportButtonsAsync("Step 9 (after Continue)");
-        }
-
-        // ── 9b) Click "Pay & Book" → gateway redirect ─────────────────────────
-        bool hasPayBook = await WaitForAsync($"!!({PayBookBtnJs})", 10000);
-        if (hasPayBook)
-        {
-            await EnsureAsync(
-                "Step 9b — Pay & Book → gateway",
-                async () => {
-                    if (!await ClickDomAsync(PayBookBtnJs))
-                        if (!await ClickAsync(PayBookBtnJs))
-                            await ClickText("button,a", "Pay & Book");
-                },
-                // verified once the gateway/QR screen has loaded (or both action
-                // buttons are gone → we left the review page)
-                $@"({GatewayReadyJs}) || !(
-                     Array.from(document.querySelectorAll('button,a')).some(function(b){{
-                        var t=(b.innerText||'').trim().toUpperCase();
-                        return ((t.includes('PAY')&&t.includes('BOOK'))||t==='CONTINUE')
-                               && b.offsetParent!==null;
-                     }}))",
-                maxAttempts: 5, settleMs: 3500, promptOnFail: false);
-        }
-        else
-        {
-            Report("Step 9 — Pay & Book button not present; watching for gateway...");
-        }
-
-        // ── Wait for the payment gateway / QR screen to be fully loaded ───────
-        Report("Step 9 — Waiting for payment gateway to load...");
-        await WaitForPageReadyAsync(GatewayReadyJs, 20000);
-        Report("Step 9 — On payment gateway. Locating QR...");
         await D(1500); await InjectAsync();
+
+        // After Pay & Book, IRCTC either shows the payment gateway/QR OR bounces to
+        // its "Sorry!! please Try Again / To login click here" error page (session /
+        // transaction rejected). Detect the failure so we don't wait at Step 10 for
+        // a QR that will never come.
+        if (await WaitForAsync(BookingFailedJs, 4000))
+        {
+            Report("IRCTC rejected the booking (\"Sorry, please Try Again\" / login page). " +
+                   "The session was lost or the transaction was declined — restart the booking.");
+            throw new Exception(
+                "IRCTC returned its 'Sorry, please Try Again' page after Pay & Book — " +
+                "the booking session was rejected. Start the booking again.");
+        }
     }
 
     // Wait until (a) the document has finished loading AND (b) `readyJs` is true.
@@ -1020,6 +1034,15 @@ true;";
         for (int attempt = 0; attempt < 120; attempt++)
         {
             await D(1500); await InjectAsync();
+
+            // Bail out if IRCTC has shown its 'Sorry, please Try Again' / login page —
+            // the QR will never come.
+            if (await ExecBool(BookingFailedJs))
+            {
+                Report("Step 10 — IRCTC error page detected (\"Sorry, please Try Again\"). " +
+                       "Booking was rejected; no QR will appear. Restart the booking.");
+                return;
+            }
 
             // 0) Some gateways show a placeholder with "Click here to pay through QR".
             //    Click it ONCE to render the real scannable QR.
@@ -1208,7 +1231,7 @@ true;";
 
         // Click SIGN IN
         await ClickText("button", "SIGN IN");
-        await D(5000); await InjectAsync();
+        await D(3000); await InjectAsync();
 
         // OTP?
         if (await ExecBool("__h.pageHas('OTP') || __h.exists('input[maxlength=\"6\"]')"))
@@ -1273,26 +1296,12 @@ true;";
     var target = el.closest ? (el.closest('button,a') || el) : el;
     target.scrollIntoView({{block:'center', inline:'nearest'}});
 
-    var opts = {{bubbles:true, cancelable:true, view:window}};
-    function fire(node){{
-      try {{ node.focus(); }} catch(e) {{}}
-      ['pointerover','pointerenter','pointerdown','mousedown',
-       'pointerup','mouseup','click'].forEach(function(type){{
-        try {{
-          var ev = (type.indexOf('pointer')===0)
-            ? new PointerEvent(type, opts)
-            : new MouseEvent(type, opts);
-          node.dispatchEvent(ev);
-        }} catch(e) {{}}
-      }});
-      try {{ node.click(); }} catch(e) {{}}
-      // Some Angular buttons respond to keyboard activation (Enter / Space).
-      ['keydown','keyup'].forEach(function(type){{
-        try {{ node.dispatchEvent(new KeyboardEvent(type,
-                 {{bubbles:true, cancelable:true, key:'Enter', code:'Enter', keyCode:13}})); }} catch(e) {{}}
-      }});
-    }}
-    fire(target);
+    // SINGLE activation only. A real user click triggers the handler ONCE.
+    // We previously dispatched a synthetic 'click' event AND called .click() AND
+    // an Enter keypress — three activations, which IRCTC flags as a double-click
+    // ('Sorry!! Please Try again', reason #3). Use exactly one .click().
+    try {{ target.focus(); }} catch(e) {{}}
+    target.click();
     return true;
   }} catch(e) {{ return false; }}
 }})()");
@@ -1388,7 +1397,7 @@ true;";
     /// </summary>
     // Fully autonomous captcha solver — NEVER asks the user.
     // Reads the captcha, types it, and if rejected, refreshes and retries.
-    private async Task AutoSolveCaptchaAsync(int maxAttempts = 12)
+    private async Task AutoSolveCaptchaAsync(int maxAttempts = 8)
     {
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
@@ -1408,7 +1417,7 @@ true;";
             {
                 Report($"OCR '{text}' implausible — refreshing captcha...");
                 await RefreshCaptchaAsync();
-                await D(1200);
+                await D(600);
                 continue;
             }
 
@@ -1442,7 +1451,7 @@ true;";
   inp.dispatchEvent(new Event('change',{{bubbles:true}}));
   inp.dispatchEvent(new Event('blur',{{bubbles:true}}));
 }})();");
-            await D(500);
+            await D(300);
 
             // Verify the value actually landed in the input
             var landed = (await Exec(
@@ -1464,7 +1473,7 @@ true;";
             {
                 Report($"Captcha '{text}' rejected — fresh captcha + retry...");
                 await RefreshCaptchaAsync();
-                await D(1300);
+                await D(700);
                 continue;
             }
             return; // accepted (or no error shown yet)
