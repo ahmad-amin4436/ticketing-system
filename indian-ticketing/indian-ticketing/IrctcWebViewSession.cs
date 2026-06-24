@@ -78,7 +78,14 @@ true;";
     {
         try
         {
-            if (_wv.CoreWebView2 == null) await _wv.EnsureCoreWebView2Async();
+            if (_wv.CoreWebView2 == null)
+            {
+                var dataFolder = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Indian Ticketing", "WebView2");
+                var env = await CoreWebView2Environment.CreateAsync(null, dataFolder);
+                await _wv.EnsureCoreWebView2Async(env);
+            }
             _lastUser = username;
             _lastPass = password;
 

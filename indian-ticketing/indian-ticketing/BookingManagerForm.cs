@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Windows.Forms;
+using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
 namespace indian_ticketing;
@@ -36,7 +37,11 @@ public class BookingManagerForm : Form
         Shown += (_, _) => _split.SplitterDistance = 320;  // layout complete here
         Load  += async (_, _) =>
         {
-            await _webView.EnsureCoreWebView2Async();
+            var dataFolder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Indian Ticketing", "WebView2");
+            var env = await CoreWebView2Environment.CreateAsync(null, dataFolder);
+            await _webView.EnsureCoreWebView2Async(env);
             _webView.CoreWebView2.Navigate("https://www.irctc.co.in/nget/train-search");
         };
         RebuildCards();

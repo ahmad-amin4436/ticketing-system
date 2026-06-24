@@ -9,7 +9,11 @@
       "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error \" })",
       "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error \" } | Select-Object -First 15)",
       "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error \" }; dotnet build -c Debug 2>&1 | Select-Object -Last 3)",
-      "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error CS\" })"
+      "PowerShell(cd \"C:\\\\Users\\\\Administrator\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\"; dotnet build -c Debug 2>&1 | Where-Object { $_ -match \": error CS\" })",
+      "Bash(dir /s /b \"C:\\\\Users\\\\SHAMIM ABBAS\\\\Documents\\\\GitHub\\\\ticketing-system\\\\*.iss\")",
+      "Bash(dotnet build *)",
+      "Bash(dir /s /b \"C:\\\\Users\\\\SHAMIM ABBAS\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\\\\bin\\\\Release\")",
+      "PowerShell(& \"C:\\\\Program Files \\(x86\\)\\\\Inno Setup 6\\\\ISCC.exe\" \"C:\\\\Users\\\\SHAMIM ABBAS\\\\Documents\\\\GitHub\\\\ticketing-system\\\\indian-ticketing\\\\indian-ticketing\\\\installer\\\\indian-ticketing.iss\" 2>&1)"
     ]
   }
 }
