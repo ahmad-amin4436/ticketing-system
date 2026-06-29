@@ -10,8 +10,8 @@
 #define MyAppPublisher "Indian Ticketing"
 #define MyAppExeName "indian-ticketing.exe"
 
-; Path to the published self-contained build (relative to this .iss file).
-#define PublishDir "..\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish"
+; Path to the published build (relative to this .iss file).
+#define PublishDir "..\bin\Release\net8.0-windows10.0.19041.0\publish"
 
 [Setup]
 ; A unique AppId keeps upgrades/uninstalls tied to the same product.

@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.IO;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -35,16 +36,42 @@ public class BookingManagerForm : Form
         _txtUser.Text = "SEJAL108";
         _txtPass.Text = "Radharani@1719";
         Shown += (_, _) => _split.SplitterDistance = 320;  // layout complete here
-        Load  += async (_, _) =>
-        {
-            var dataFolder = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Indian Ticketing", "WebView2");
-            var env = await CoreWebView2Environment.CreateAsync(null, dataFolder);
-            await _webView.EnsureCoreWebView2Async(env);
-            _webView.CoreWebView2.Navigate("https://www.irctc.co.in/nget/train-search");
-        };
+        Load  += async (_, _) => await InitializeWebViewAsync();
         RebuildCards();
+    }
+
+    private static string GetWebView2UserDataFolder()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Indian Ticketing",
+            "WebView2");
+    }
+
+    private async Task InitializeWebViewAsync()
+    {
+        var dataFolder = GetWebView2UserDataFolder();
+        try
+        {
+            Directory.CreateDirectory(dataFolder);
+            _webView.CreationProperties = new CoreWebView2CreationProperties
+            {
+                UserDataFolder = dataFolder
+            };
+
+            await _webView.EnsureCoreWebView2Async();
+            _webView.CoreWebView2.Navigate("https://www.irctc.co.in/nget/train-search");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Failed to initialize embedded browser.\n\n" +
+                $"Please ensure the application can write to this folder:\n{dataFolder}\n\n" +
+                $"Error: {ex.Message}",
+                "WebView2 Initialization Failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     // ── UI construction ───────────────────────────────────────────────────

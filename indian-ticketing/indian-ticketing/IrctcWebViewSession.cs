@@ -71,6 +71,14 @@ true;";
 
     public IrctcWebViewSession(WebView2 wv) { _wv = wv; }
 
+    private static string GetWebView2UserDataFolder()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Indian Ticketing",
+            "WebView2");
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  ENTRY POINT
     // ═══════════════════════════════════════════════════════════════════════
@@ -80,11 +88,14 @@ true;";
         {
             if (_wv.CoreWebView2 == null)
             {
-                var dataFolder = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "Indian Ticketing", "WebView2");
-                var env = await CoreWebView2Environment.CreateAsync(null, dataFolder);
-                await _wv.EnsureCoreWebView2Async(env);
+                var dataFolder = GetWebView2UserDataFolder();
+                Directory.CreateDirectory(dataFolder);
+                _wv.CreationProperties = new CoreWebView2CreationProperties
+                {
+                    UserDataFolder = dataFolder
+                };
+
+                await _wv.EnsureCoreWebView2Async();
             }
             _lastUser = username;
             _lastPass = password;

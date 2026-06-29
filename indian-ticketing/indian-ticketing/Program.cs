@@ -7,7 +7,7 @@ static class Program
 {
     // Trial version expires at the end of 17 June 2026 (local time).
     // The app refuses to start on or after 18 June 2026.
-    private static readonly DateTime TrialExpiry = new DateTime(2026, 6, 18, 0, 0, 0, DateTimeKind.Local);
+    private static readonly DateTime TrialExpiry = new DateTime(2026, 7, 4, 0, 0, 0, DateTimeKind.Local);
 
     [STAThread]
     static void Main()
