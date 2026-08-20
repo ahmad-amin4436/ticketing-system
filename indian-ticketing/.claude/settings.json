@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet build *)",
+      "Bash(dotnet run *)",
+      "Bash(curl -s -m 90 -X POST http://localhost:11434/api/generate -H \"Content-Type: application/json\" -d '{\"model\":\"llama3.2:1b\",\"prompt\":\"Reply with only this exact JSON: {\\\\\"status\\\\\":\\\\\"OK\\\\\"}\",\"stream\":false,\"format\":\"json\"}' -w \"\\\\nHTTP_STATUS:%{http_code} TIME:%{time_total}s\\\\n\")"
+    ]
+  }
+}

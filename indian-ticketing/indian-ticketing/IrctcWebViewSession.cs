@@ -23,12 +23,13 @@ public class IrctcWebViewSession
     private TaskCompletionSource<bool>? _userAckTcs;
     private string _lastUser = "";
     private string _lastPass = "";
+    private readonly ProxyConfig? _proxy;
 
     public event Action<string>? OnStatus;
     public event Action<System.Drawing.Bitmap>? OnQrReady;
 
     // ── JS helpers ────────────────────────────────────────────────────────
-    private const string HelperJs = @"
+    internal const string HelperJs = @"
 window.__h = {
     fill: function(sel, val) {
         var el = document.querySelector(sel);
@@ -69,7 +70,7 @@ window.__h = {
 };
 true;";
 
-    public IrctcWebViewSession(WebView2 wv) { _wv = wv; }
+    public IrctcWebViewSession(WebView2 wv, ProxyConfig? proxy = null) { _wv = wv; _proxy = proxy; }
 
     private static string GetWebView2UserDataFolder()
     {
@@ -90,20 +91,62 @@ true;";
             {
                 var dataFolder = GetWebView2UserDataFolder();
                 Directory.CreateDirectory(dataFolder);
+
+                var envOptions = new CoreWebView2EnvironmentOptions();
+                var proxyArg = _proxy?.GetProxyServerArg();
+                if (!string.IsNullOrEmpty(proxyArg))
+                {
+                    envOptions.AdditionalBrowserArguments = proxyArg;
+                    Report($"Proxy configured: {_proxy?.Host}:{_proxy?.Port} (auth: {_proxy?.HasCredentials})");
+                }
+
+                var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
                 _wv.CreationProperties = new CoreWebView2CreationProperties
                 {
                     UserDataFolder = dataFolder
                 };
 
-                await _wv.EnsureCoreWebView2Async();
+                await _wv.EnsureCoreWebView2Async(env);
+
+                // Auto-answer the native proxy-auth dialog ("Sign in to access this
+                // site") with the configured proxy credentials, so it never blocks
+                // the UI waiting for a manual Username/Password/Sign in.
+                if (_proxy != null && _proxy.HasCredentials)
+                {
+                    _wv.CoreWebView2.BasicAuthenticationRequested += (s, e) =>
+                    {
+                        e.Response.UserName = _proxy.Username;
+                        e.Response.Password = _proxy.Password;
+                    };
+                }
+
+                // Load proxy auth extension AFTER profile is available
+                if (_proxy != null)
+                {
+                    var extPath = ProxyConfig.EnsureAuthExtension(_proxy);
+                    if (extPath != null && _wv.CoreWebView2?.Profile != null)
+                    {
+                        try
+                        {
+                            await _wv.CoreWebView2.Profile.AddBrowserExtensionAsync(extPath);
+                            Report("Proxy auth extension loaded.");
+                        }
+                        catch
+                        {
+                            Report("Proxy auth extension already loaded or failed (non-critical).");
+                        }
+                    }
+                }
             }
             _lastUser = username;
             _lastPass = password;
 
             // ── Step 1 — Open IRCTC and search (NO login yet) ─────────────
-            Report("Step 1 — Opening IRCTC...");
+            Report("Step 1 — C...");
             await NavAsync("https://www.irctc.co.in/nget/train-search");
             await D(1500); await InjectAsync();   // NavAsync already awaited load
+
+            await DismissLanguageAlertAsync();    // "Alert" Hindi/English popup, if shown
 
             await Step1_SearchAsync(booking);           // search with saved filters
 
@@ -132,6 +175,27 @@ true;";
             await Step10_CaptureQrAsync();
         }
         catch (Exception ex) { Report($"Error: {ex.Message}"); }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 1 (pre) — Dismiss the "Alert" language-selection popup, if IRCTC
+    //  shows it right after the site loads, by choosing English.
+    // ═══════════════════════════════════════════════════════════════════════
+    private async Task DismissLanguageAlertAsync()
+    {
+        bool present = await WaitForAsync(@"(function(){
+  var title = document.querySelector('.ui-dialog-title');
+  return !!title && title.innerText.trim().toUpperCase()==='ALERT';
+})()", 4000);
+        if (!present) return;
+
+        Report("Step 1 — Language popup detected, selecting English...");
+        bool clicked = await ClickText("button", "English");
+        if (!clicked)
+            await ClickDomAsync(
+                "Array.from(document.querySelectorAll('button')).find(function(e){return (e.innerText||'').trim()==='English';})");
+
+        await D(500); await InjectAsync();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -179,13 +243,21 @@ true;";
         }
         await D(600);
 
-        // Class filter (if available)
+        // Class filter (if a specific class was saved — "All Classes" is already
+        // the page default, so leave it alone).
         if (!string.IsNullOrEmpty(b.TravelClass) && b.TravelClass != "All Classes")
         {
-            await ClickAsync(
-                $"Array.from(document.querySelectorAll('p-dropdown option, p-dropdown li, select option'))" +
-                $".find(function(e){{return (e.innerText||'').includes('{b.TravelClass}');}})");
-            await D(400);
+            bool clsOk = await SelectDropdownAsync("journeyClass", 0, ClassKeyword(b.TravelClass));
+            if (!clsOk) Report($"Step 1 — Could not select class '{b.TravelClass}', left at default.");
+            await D(300); await InjectAsync();
+        }
+
+        // Quota filter (GN/General is already the page default).
+        if (!string.IsNullOrEmpty(b.Quota) && b.Quota != "GN")
+        {
+            bool qOk = await SelectDropdownAsync("journeyQuota", 1, QuotaKeyword(b.Quota));
+            if (!qOk) Report($"Step 1 — Could not select quota '{b.Quota}', left at default.");
+            await D(300); await InjectAsync();
         }
 
         // Click Search
@@ -210,21 +282,31 @@ true;";
             await UserAckAsync(); await InjectAsync();
         }
 
-        // Step 3a — click the class availability box (shows "Refresh ↻")
+        // Step 3a — click the class availability box (shows "Refresh ↻") that
+        // belongs to THIS saved train. The results list shows several trains
+        // at once, each with its own class boxes, so a page-wide text match
+        // was clicking whichever train's box happened to come first in the
+        // DOM instead of the one the user actually saved.
         var kw   = ClassKeyword(b.TravelClass).ToUpper();
         var code = b.TravelClass.ToUpper();
-        Report($"Step 3 — Clicking class [{code}]...");
+        Report($"Step 3 — Clicking class [{code}] for train {b.TrainNo}...");
 
-        bool classClicked = await ClickAsync(
-            $"Array.from(document.querySelectorAll('div,span,td'))" +
-            $".filter(function(e){{" +
-            $"  var t=(e.innerText||'').toUpperCase().trim();" +
-            $"  return (t.includes('{kw}')||t.includes('{code}'))" +
-            $"      && t.includes('REFRESH') && e.offsetHeight>0 && e.offsetHeight<150;" +
-            $"}}).sort(function(a,b){{return a.offsetHeight-b.offsetHeight;}})[0]");
+        // Scroll the train's row into view first and poll for its class box
+        // rather than a single immediate attempt: each train's fare/class
+        // availability appears to load independently of its heading (that's
+        // what the "Refresh" placeholder means), so a row further down the
+        // results list can still be filling in a moment after Step 2 already
+        // found its heading text on the page.
+        await ScrollTrainIntoViewAsync(b.TrainNo);
+        await D(500); await InjectAsync();
+
+        var classJs = ClassBoxJs(b.TrainNo, kw, code);
+        await WaitForAsync($"!!({classJs})", 6000);
+        bool classClicked = await ClickAsync(classJs);
 
         if (!classClicked)
         {
+            await ReportClassBoxesAsync(b.TrainNo, kw, code);
             Report($"Class box not clickable — click '{code}' manually, then 'OK (Continue)'.");
             await UserAckAsync(); await InjectAsync();
         }
@@ -247,21 +329,27 @@ true;";
         }
         await D(400); await InjectAsync();
 
-        // Step 3c — click the saved journey date
+        // Step 3c — click the saved journey date. Confirmed live markup: each
+        // date option is ALSO a ".pre-avl" widget (the same component the
+        // class tabs used before the panel expanded), with the date text in
+        // its own <strong> and the WL/AVAILABLE/NOT AVAILABLE status in a
+        // separate sibling <strong> — so match on the date's <strong>
+        // specifically instead of a combined-text/height heuristic. The
+        // class tabs are now a <p-tabmenu>/<li> structure at this point (not
+        // ".pre-avl"), so this selector can't collide with them.
         var dp    = b.JourneyDate.Split('-');
         var day   = dp.Length > 0 ? dp[0].TrimStart('0') : "";
         var month = dp.Length > 1 ? dp[1].ToUpper() : "";
         Report($"Step 3 — Selecting date {day} {month}...");
 
-        bool dateClicked = await ClickAsync(
-            $"Array.from(document.querySelectorAll('div,span,td,li'))" +
-            $".filter(function(e){{" +
-            $"  var t=(e.innerText||'').trim();" +
-            $"  return t.length<80 && t.includes('{day}')" +
-            $"      && t.toUpperCase().includes('{month}')" +
-            $"      && !t.includes('DEPARTED')" +
-            $"      && e.offsetHeight>0 && e.offsetHeight<100;" +
-            $"}}).sort(function(a,b){{return a.offsetHeight-b.offsetHeight;}})[0]");
+        bool dateClicked = await ClickAsync($@"(function(){{
+  var day = '{day}', month = '{month}';
+  return Array.from(document.querySelectorAll('.pre-avl')).find(function(box){{
+    var label = box.querySelector('strong');
+    var t = ((label && label.textContent) || '').toUpperCase();
+    return t.includes(day) && t.includes(month) && !t.includes('DEPARTED');
+  }});
+}})()");
 
         if (!dateClicked)
         {
@@ -269,17 +357,23 @@ true;";
             await UserAckAsync(); await InjectAsync();
         }
 
-        // Step 3d — wait for Book Now to become enabled
+        // Step 3d — wait for Book Now to become enabled, and Step 4 — click
+        // it. Every train card has its own "Book Now" button, and a train
+        // that hasn't had a class/date picked yet still renders its button
+        // WITHOUT the HTML disabled attribute (it just looks muted via CSS)
+        // — so a page-wide "!b.disabled" search matched whichever train's
+        // button came first in the DOM (e.g. Gitanjali Exp) instead of the
+        // saved train's own, now-actually-active one. Scope to this train's
+        // card the same way the class box is scoped: find the card first
+        // (an ancestor of the train's number label that contains a "Book
+        // Now" button at all), then look for the enabled one inside it.
+        var bookNowJs = BookNowBtnJs(b.TrainNo);
         Report("Step 3 — Waiting for Book Now to enable...");
-        await WaitForAsync(
-            "Array.from(document.querySelectorAll('button')).some(function(b){return b.innerText.trim().toUpperCase()==='BOOK NOW'&&!b.disabled;})",
-            8000);
+        await WaitForAsync($"!!({bookNowJs})", 8000);
         await D(600); await InjectAsync();
 
-        // Step 4 — click Book Now
         Report("Step 4 — Clicking Book Now...");
-        bool bookClicked = await ClickAsync(
-            "Array.from(document.querySelectorAll('button')).find(function(b){return b.innerText.trim().toUpperCase()==='BOOK NOW'&&!b.disabled;})");
+        bool bookClicked = await ClickAsync(bookNowJs);
 
         if (!bookClicked)
         {
@@ -901,6 +995,168 @@ true;";
           && (t.includes('BHIM/ UPI/ USSD') || t.includes('BHIM/UPI/USSD'));
     })()";
 
+    // Finds the class-availability box for a specific train. Confirmed live
+    // markup (via DevTools) for each class is:
+    //   <div class="pre-avl" tabindex="0">
+    //     <div><strong>AC 2 Tier (2A)</strong></div>
+    //     <div class="col-xs-12 link"> Refresh <span class="fa fa-repeat"></span></div>
+    //   </div>
+    // The class label and the "Refresh" text are separate sibling divs — no
+    // single element contains both — so matching must target the actual
+    // ".pre-avl" widget (it even carries tabindex="0", marking it as the
+    // real clickable unit) via its <strong> label, not a fuzzy combined-text
+    // search. Scoped to the train's own card first (walk up from its number
+    // label to the nearest ancestor containing a ".pre-avl"), falling back
+    // to a page-wide match if the card can't be located.
+    private static string ClassBoxJs(string trainNo, string kw, string code) => $@"(function(){{
+  function findBox(root){{
+    return Array.from(root.querySelectorAll('.pre-avl')).find(function(box){{
+      var label = box.querySelector('strong');
+      var t = ((label && label.textContent) || box.innerText || '').toUpperCase();
+      return t.includes('{kw}') || t.includes('{code}');
+    }});
+  }}
+
+  var trainNo = '{trainNo}';
+  var labelEls = Array.from(document.querySelectorAll('*')).filter(function(e){{
+    return e.offsetParent!==null && e.children.length<=3 && (e.textContent||'').includes(trainNo);
+  }});
+  labelEls.sort(function(a,b){{ return (a.textContent||'').length-(b.textContent||'').length; }});
+  var trainEl = labelEls[0];
+
+  if (trainEl) {{
+    var anc = trainEl, hops = 0;
+    while (anc) {{
+      if (anc.querySelector && anc.querySelector('.pre-avl')) {{
+        var scoped = findBox(anc);
+        if (scoped) return scoped;
+        break;               // found the card but no matching class inside it — fall through
+      }}
+      anc = anc.parentElement; hops++;
+      if (hops > 15) break;
+    }}
+  }}
+  return findBox(document);  // fall back to a page-wide match rather than failing outright
+}})()";
+
+    // Finds the ENABLED "Book Now" button for a specific train. Every train
+    // card has its own button, and a train with no class/date picked yet
+    // still renders its button without the HTML disabled attribute (only
+    // muted via CSS) — so an unscoped "not disabled" search matches
+    // whichever train's button comes first in the DOM. Scope to the train's
+    // card first (an ancestor of its number label containing a "Book Now"
+    // button at all, enabled or not), then require the enabled one inside
+    // it — falling back to a page-wide match if the card can't be located.
+    private static string BookNowBtnJs(string trainNo) => $@"(function(){{
+  function anyBtn(root){{
+    return Array.from(root.querySelectorAll('button')).find(function(b){{
+      return b.innerText.trim().toUpperCase()==='BOOK NOW';
+    }});
+  }}
+  function enabledBtn(root){{
+    return Array.from(root.querySelectorAll('button')).find(function(b){{
+      return b.innerText.trim().toUpperCase()==='BOOK NOW' && !b.disabled;
+    }});
+  }}
+
+  var trainNo = '{trainNo}';
+  var labelEls = Array.from(document.querySelectorAll('*')).filter(function(e){{
+    return e.offsetParent!==null && e.children.length<=3 && (e.textContent||'').includes(trainNo);
+  }});
+  labelEls.sort(function(a,b){{ return (a.textContent||'').length-(b.textContent||'').length; }});
+  var trainEl = labelEls[0];
+
+  if (trainEl) {{
+    var anc = trainEl, hops = 0;
+    while (anc) {{
+      if (anyBtn(anc)) {{
+        var scoped = enabledBtn(anc);
+        if (scoped) return scoped;
+        break;               // found the card but its button isn't enabled yet
+      }}
+      anc = anc.parentElement; hops++;
+      if (hops > 20) break;
+    }}
+  }}
+  return enabledBtn(document);  // fall back to a page-wide match rather than failing outright
+}})()";
+
+    // Scrolls a specific train's row into view before Step 3a searches for
+    // its class box — the results list can be long enough that the saved
+    // train sits below the fold, and some sites only finish computing a
+    // row's fare/availability text once it's near the viewport.
+    private async Task ScrollTrainIntoViewAsync(string trainNo)
+    {
+        await Exec($@"(function(){{
+  var trainNo = '{trainNo}';
+  var labelEls = Array.from(document.querySelectorAll('*')).filter(function(e){{
+    return e.offsetParent!==null && e.children.length<=3 && (e.textContent||'').includes(trainNo);
+  }});
+  labelEls.sort(function(a,b){{ return (a.textContent||'').length-(b.textContent||'').length; }});
+  var el = labelEls[0];
+  if (el) el.scrollIntoView({{block:'center', inline:'nearest'}});
+}})()");
+    }
+
+    // Diagnostic for a failed Step 3a class-box click: reports every ".pre-avl"
+    // box on the page (its <strong> label, size, and whether it sits inside
+    // this train's card) so a failure is debuggable from the status log
+    // instead of a blind guess about the page's markup.
+    private async Task ReportClassBoxesAsync(string trainNo, string kw, string code)
+    {
+        var raw = await Exec($@"(function(){{
+  function describe(box){{
+    var r = box.getBoundingClientRect();
+    var label = box.querySelector('strong');
+    return {{ label:((label&&label.textContent)||box.innerText||'').replace(/\s+/g,' ').slice(0,50),
+      offsetH:box.offsetHeight, offsetW:box.offsetWidth,
+      rectW:Math.round(r.width), rectH:Math.round(r.height) }};
+  }}
+
+  var trainNo='{trainNo}', kw='{kw}', code='{code}';
+  var out = {{ trainNo:trainNo, kw:kw, code:code, trainElFound:false, trainElTag:'', trainElText:'',
+    scopeFound:false, scopeHops:-1, scopeTag:'', boxesInScope:[], boxesGlobal:[] }};
+
+  var labelEls = Array.from(document.querySelectorAll('*')).filter(function(e){{
+    return e.offsetParent!==null && e.children.length<=3 && (e.textContent||'').includes(trainNo);
+  }});
+  labelEls.sort(function(a,b){{ return (a.textContent||'').length-(b.textContent||'').length; }});
+  var trainEl = labelEls[0];
+  if (trainEl) {{
+    out.trainElFound = true; out.trainElTag = trainEl.tagName;
+    out.trainElText = (trainEl.textContent||'').slice(0,60);
+
+    var anc = trainEl, hops = 0;
+    while (anc) {{
+      if (anc.querySelector && anc.querySelector('.pre-avl')) {{
+        out.scopeFound = true; out.scopeHops = hops; out.scopeTag = anc.tagName;
+        out.boxesInScope = Array.from(anc.querySelectorAll('.pre-avl')).slice(0,10).map(describe);
+        break;
+      }}
+      anc = anc.parentElement; hops++;
+      if (hops>15) break;
+    }}
+  }}
+
+  out.boxesGlobal = Array.from(document.querySelectorAll('.pre-avl')).slice(0,20).map(describe);
+
+  return JSON.stringify(out);
+}})()");
+        var json = raw.Trim('"').Replace("\\\"", "\"").Replace("\\\\", "\\");
+
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "IndianTicketing");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "class_box_diag.json"), json);
+        }
+        catch { /* diagnostic-only, never block the flow */ }
+
+        Report($"Step 3 diag — train {trainNo}, class {code}: see class_box_diag.json");
+    }
+
     // Report the visible action buttons currently on the page — turns a silent
     // race into hard data in the status log so we can see what Step 9 is seeing.
     private async Task ReportButtonsAsync(string tag)
@@ -1211,7 +1467,7 @@ true;";
     // ═══════════════════════════════════════════════════════════════════════
     //  LOGIN (used in Step 1 and Step 5)
     // ═══════════════════════════════════════════════════════════════════════
-    private async Task LoginAsync(string user, string pass)
+    public async Task LoginAsync(string user, string pass)
     {
         // Open login dialog if not already open
         if (!await ExecBool(@"__h.exists('input[placeholder=""User Name""]') || __h.exists('input[formcontrolname=""userid""]')"))
@@ -1331,6 +1587,35 @@ true;";
         => ClickAsync(
             $"Array.from(document.querySelectorAll('{tags}'))" +
             $".find(function(e){{return (e.innerText||'').toUpperCase().includes('{txt.ToUpper().Replace("'", "\\'")}')&&e.offsetParent!==null;}})");
+
+    // PrimeNG p-dropdown options (<li>) only exist in the DOM once the panel
+    // is opened (they're rendered into an overlay on demand) — so unlike a
+    // native <select>, we must open the dropdown first, wait for its panel,
+    // then click the item whose text matches. formControlName is tried first
+    // (stable, since it's a literal template attribute); positionalIndex is
+    // the fallback rank among all <p-dropdown> elements on the page.
+    private async Task<bool> SelectDropdownAsync(string formControlName, int positionalIndex, string keyword)
+    {
+        var triggerJs = $@"(function(){{
+  var host = document.querySelector('p-dropdown[formcontrolname=""{formControlName}""]');
+  if (!host) host = document.querySelectorAll('p-dropdown')[{positionalIndex}];
+  if (!host) return null;
+  return host.querySelector('.ui-dropdown, .p-dropdown') || host;
+}})()";
+        bool opened = await ClickAsync(triggerJs);
+        if (!opened) return false;
+
+        bool panelReady = await WaitForAsync(
+            "__h.exists('.p-dropdown-item, li.ui-dropdown-item, .ui-dropdown-panel li, .p-dropdown-panel li')", 2500);
+        if (!panelReady) return false;
+
+        var kw = Esc(keyword.ToUpper());
+        bool picked = await ClickAsync(
+            $"Array.from(document.querySelectorAll('.p-dropdown-item, li.ui-dropdown-item, .ui-dropdown-panel li, .p-dropdown-panel li'))" +
+            $".find(function(e){{return (e.innerText||'').toUpperCase().includes('{kw}');}})");
+        await D(300);
+        return picked;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP-GATE PRIMITIVE
@@ -1707,6 +1992,12 @@ true;";
         "CC"=>"Chair Car","2S"=>"2nd Sitting","3E"=>"Economy","FC"=>"First Class",_=>code,
     };
 
+    private static string QuotaKeyword(string code) => code.ToUpper() switch
+    {
+        "GN"=>"GENERAL","TQ"=>"TATKAL","PT"=>"PREMIUM TATKAL","LD"=>"LADIES",
+        "SS"=>"SENIOR CITIZEN","HP"=>"HANDICAP","DP"=>"DUTY PASS",_=>code,
+    };
+
     private static string MonthNum(string m) => m.ToLower() switch
     {
         "jan"=>"01","feb"=>"02","mar"=>"03","apr"=>"04","may"=>"05","jun"=>"06",
@@ -1718,7 +2009,8 @@ true;";
 
     // Wrap JS expression string for passing to __h.rect()
     private static string JsStr(string expr)
-        => "\"" + expr.Replace("\\","\\\\").Replace("\"","\\\"").Replace("\n","\\n") + "\"";
+        => "\"" + expr.Replace("\\","\\\\").Replace("\"","\\\"")
+                      .Replace("\r\n","\\n").Replace("\n","\\n").Replace("\r","\\n") + "\"";
 
     private static Task D(int ms) => Task.Delay(ms);
     private void Report(string m) => OnStatus?.Invoke(m);

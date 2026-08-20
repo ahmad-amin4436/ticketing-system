@@ -45,11 +45,18 @@ public class TrainInfo
 // instead. The TrainScraper public surface (SearchAsync / Dispose) is unchanged.
 public class TrainScraper : IDisposable
 {
-    private static readonly HttpClient Http = CreateClient();
+    private readonly HttpClient _http;
 
-    private static HttpClient CreateClient()
+    public TrainScraper(ProxyConfig? proxy = null)
     {
-        var c = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+        _http = CreateClient(proxy);
+    }
+
+    private static HttpClient CreateClient(ProxyConfig? proxy)
+    {
+        var handler = new HttpClientHandler();
+        proxy?.ApplyToHandler(handler);
+        var c = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
         c.DefaultRequestHeaders.UserAgent.ParseAdd(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
@@ -79,7 +86,7 @@ public class TrainScraper : IDisposable
         string raw;
         try
         {
-            raw = await Http.GetStringAsync(url);
+            raw = await _http.GetStringAsync(url);
         }
         catch (Exception ex)
         {

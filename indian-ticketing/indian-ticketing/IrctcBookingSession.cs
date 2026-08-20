@@ -17,6 +17,7 @@ public class IrctcBookingSession : IDisposable
 {
     private ChromeDriver? _driver;
     private bool _disposed;
+    private readonly ProxyConfig? _proxy;
 
     public string       BookingId { get; }
     public SavedBooking Booking   { get; }
@@ -26,10 +27,11 @@ public class IrctcBookingSession : IDisposable
     public event Action<Bitmap>? OnQrReady;
 
     // ── public ───────────────────────────────────────────────────────────────
-    public IrctcBookingSession(SavedBooking booking)
+    public IrctcBookingSession(SavedBooking booking, ProxyConfig? proxy = null)
     {
         BookingId = booking.Id;
         Booking   = booking;
+        _proxy    = proxy;
     }
 
     public Task StartAsync(string username, string password)
@@ -41,7 +43,13 @@ public class IrctcBookingSession : IDisposable
         try
         {
             Report(BookingStatus.Starting, "Opening browser...");
-            _driver = CreateDriver();
+            _driver = CreateDriver(_proxy);
+
+            if (_proxy != null && _proxy.IsConfigured)
+            {
+                Report(BookingStatus.Starting,
+                    $"Proxy: {_proxy.Host}:{_proxy.Port} | Auth: {_proxy.HasCredentials}");
+            }
 
             Report(BookingStatus.LoggingIn, "Navigating to IRCTC...");
             _driver.Navigate().GoToUrl("https://www.irctc.co.in/nget/train-search");
@@ -350,13 +358,13 @@ public class IrctcBookingSession : IDisposable
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
-    private static ChromeDriver CreateDriver()
+    private static ChromeDriver CreateDriver(ProxyConfig? proxy = null)
     {
         var opts = new ChromeOptions();
         // Visible mode — user can see and interact
         opts.AddArgument("--no-sandbox");
         opts.AddArgument("--disable-gpu");
-        opts.AddArgument("--disable-extensions");
+        // NOTE: Do NOT use --disable-extensions — we need extensions for proxy auth
         opts.AddArgument("--no-first-run");
         opts.AddArgument("--window-size=1366,768");
         // Mask webdriver detection
@@ -365,6 +373,16 @@ public class IrctcBookingSession : IDisposable
         opts.AddAdditionalOption("useAutomationExtension", false);
         opts.AddArgument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+
+        proxy?.ApplyToChromeOptions(opts);
+
+        // If proxy requires auth, load the auth extension
+        var extPath = ProxyConfig.EnsureAuthExtension(proxy ?? new ProxyConfig());
+        if (extPath != null)
+        {
+            opts.AddArgument($"--disable-extensions-except={extPath}");
+            opts.AddArgument($"--load-extension={extPath}");
+        }
 
         var svc = ChromeDriverService.CreateDefaultService();
         svc.HideCommandPromptWindow = true;

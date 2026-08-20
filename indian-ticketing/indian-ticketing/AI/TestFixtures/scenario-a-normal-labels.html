@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!--
+  Spec §39 Scenario A: a minimal train-search form with ordinary, plainly-labeled fields
+  and no framework quirks. Used to sanity-check WebViewPageObserver's element discovery
+  and AiModelRouter's decision-making against a known-simple DOM, independent of IRCTC's
+  live Angular/PrimeNG markup and without risking a real booking. Not shipped in the
+  installer (see docs/known-issues.md's AI-agent notes for how to point the app at this
+  file during development).
+
+  To add more scenarios (relabeled fields, an extra intermediate page, a popup, etc. —
+  spec §39 Scenarios B-F), copy this file and adjust the markup; nothing else needs to
+  change, since the observer has no knowledge of this fixture baked into it.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Train Search — Fixture</title>
+<style>
+  body { font-family: sans-serif; max-width: 420px; margin: 40px auto; }
+  label { display: block; margin-top: 12px; font-weight: bold; }
+  input { width: 100%; padding: 6px; box-sizing: border-box; }
+  button { margin-top: 16px; padding: 8px 16px; }
+  #results { margin-top: 20px; padding: 10px; background: #eef; display: none; }
+</style>
+</head>
+<body>
+<h2>Book a train ticket. Enter your journey details below.</h2>
+
+<label for="from">From</label>
+<input id="from" type="text" placeholder="Enter source station">
+
+<label for="to">To</label>
+<input id="to" type="text" placeholder="Enter destination station">
+
+<label for="date">Journey Date</label>
+<input id="date" type="text" placeholder="dd-mm-yyyy">
+
+<button id="search" onclick="document.getElementById('results').style.display='block'">Search</button>
+
+<div id="results">Trains found — pick one to continue.</div>
+</body>
+</html>

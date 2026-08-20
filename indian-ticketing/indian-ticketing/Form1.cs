@@ -5,7 +5,7 @@ namespace indian_ticketing;
 
 public partial class Form1 : Form
 {
-    private readonly TrainScraper _scraper = new();
+    private readonly TrainScraper _scraper;
 
     // erail.in train-type colours
     private static readonly Color ColRajdhani  = Color.FromArgb(0xFF, 0x48, 0x0B);
@@ -28,6 +28,7 @@ public partial class Form1 : Form
     public Form1()
     {
         InitializeComponent();
+        _scraper = new TrainScraper(ProxyConfig.Load());
         BuildColumns();
         dgvTrains.CellFormatting += DgvTrains_CellFormatting;
         InitAutocomplete();
