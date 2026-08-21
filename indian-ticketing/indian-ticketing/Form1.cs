@@ -1,11 +1,30 @@
 using System.Drawing;
 using System.Windows.Forms;
+using Microsoft.Web.WebView2.WinForms;
 
 namespace indian_ticketing;
 
 public partial class Form1 : Form
 {
-    private readonly TrainScraper _scraper;
+    // Background WebView2 used to search IRCTC directly. Two things it must
+    // NOT be, both confirmed to actually matter here:
+    //  1. Occluded — Chromium throttles timers/rendering for a fully-covered
+    //     surface the same way it throttles a backgrounded tab (this used to
+    //     be SendToBack'd, fully covered by the grid).
+    //  2. Tiny — IRCTC's page leans heavily on responsive breakpoints
+    //     (hidden-xs vs. hidden-lg/md/sm duplicate elements, seen repeatedly
+    //     while reverse-engineering its markup). A 4x4px control renders at
+    //     a 4x4 CSS viewport, which media queries treat as narrower than any
+    //     real mobile screen — selectors built against the desktop markup
+    //     (verified against a normal-sized browser window) can end up
+    //     targeting hidden elements while the mobile duplicates are the ones
+    //     actually shown.
+    // Fixed by giving it a real desktop-class size and moving it off-screen
+    // (not zero-sized/hidden) — a WebView2 hosts an actual child HWND, so an
+    // off-canvas position still renders and executes normally; it's just
+    // never inside the form's visible client area.
+    private WebView2 _webView = new() { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
+    private readonly ProxyConfig _proxy = ProxyConfig.Load();
 
     // erail.in train-type colours
     private static readonly Color ColRajdhani  = Color.FromArgb(0xFF, 0x48, 0x0B);
@@ -28,10 +47,12 @@ public partial class Form1 : Form
     public Form1()
     {
         InitializeComponent();
-        _scraper = new TrainScraper(ProxyConfig.Load());
         BuildColumns();
         dgvTrains.CellFormatting += DgvTrains_CellFormatting;
         InitAutocomplete();
+
+        Controls.Add(_webView);
+        _webView.BringToFront();
     }
 
     // ── Autocomplete ─────────────────────────────────────────────────────────
@@ -255,8 +276,8 @@ public partial class Form1 : Form
     // ── Search button ─────────────────────────────────────────────────────────
     private async void btnGetTrains_Click(object? sender, EventArgs e)
     {
-        var (fromName, fromCode) = ResolveStation(txtFrom, _fromStn);
-        var (toName,   toCode)   = ResolveStation(txtTo,   _toStn);
+        var (_, fromCode) = ResolveStation(txtFrom, _fromStn);
+        var (_, toCode)   = ResolveStation(txtTo,   _toStn);
 
         if (string.IsNullOrWhiteSpace(fromCode) || string.IsNullOrWhiteSpace(toCode))
         {
@@ -267,7 +288,7 @@ public partial class Form1 : Form
 
         btnGetTrains.Enabled = false;
         dgvTrains.DataSource = null;
-        lblStatus.Text       = "Searching…";
+        lblStatus.Text       = "Searching IRCTC…";
 
         var date     = dtpDate.Value.ToString("dd-MMM-yyyy");
         var progress = new Progress<string>(msg =>
@@ -275,8 +296,7 @@ public partial class Form1 : Form
 
         try
         {
-            var trains = await _scraper.SearchAsync(
-                fromName, fromCode, toName, toCode, date, progress);
+            var trains = await SearchTrainsWithProxyFallbackAsync(fromCode, toCode, date, progress);
             dgvTrains.DataSource = trains;
             lblStatus.Text = trains.Count > 0
                 ? $"{trains.Count} trains found  |  {fromCode} → {toCode}  |  {date}"
@@ -288,6 +308,36 @@ public partial class Form1 : Form
             MessageBox.Show(ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally { btnGetTrains.Enabled = true; }
+    }
+
+    // Tries IRCTC direct first; if its edge WAF blocks the connection
+    // outright (IrctcBlockedException), tears down the background browser
+    // control and retries once through the configured proxy. WebView2's
+    // proxy is fixed for the life of a browser process, so a proxy retry
+    // needs a fresh control, not just a re-navigate.
+    private async Task<List<TrainInfo>> SearchTrainsWithProxyFallbackAsync(
+        string fromCode, string toCode, string date, IProgress<string> progress)
+    {
+        try
+        {
+            var session = new IrctcWebViewSession(_webView, _proxy);
+            return await session.SearchTrainsAsync(fromCode, toCode, date, progress);
+        }
+        catch (IrctcBlockedException) when (_proxy.IsConfigured)
+        {
+            progress.Report("IRCTC blocked direct access — retrying through proxy...");
+
+            var old = _webView;
+            Controls.Remove(old);
+            old.Dispose();
+
+            _webView = new WebView2 { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
+            Controls.Add(_webView);
+            _webView.BringToFront();
+
+            var session = new IrctcWebViewSession(_webView, _proxy);
+            return await session.SearchTrainsAsync(fromCode, toCode, date, progress, useProxy: true);
+        }
     }
 
     // ── Save Train button ─────────────────────────────────────────────────────
@@ -375,7 +425,7 @@ public partial class Form1 : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        _scraper.Dispose();
+        _webView.Dispose();
         base.OnFormClosed(e);
     }
 }

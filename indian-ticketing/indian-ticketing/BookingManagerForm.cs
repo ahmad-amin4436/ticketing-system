@@ -31,7 +31,7 @@ public class BookingManagerForm : Form
     private readonly Button         _btnRefresh  = new();
     private readonly Button         _btnSaveProxy = new();
     private readonly FlowLayoutPanel _cardPanel  = new();
-    private readonly WebView2       _webView     = new();
+    private WebView2                _webView     = new();
 
     // ── State ─────────────────────────────────────────────────────────────
     private List<SavedBooking>        _bookings = SavedBooking.LoadAll();
@@ -78,7 +78,14 @@ public class BookingManagerForm : Form
         catch { return false; }
     }
 
-    private async Task InitializeWebViewAsync()
+    // Always try IRCTC direct first — most of the time no proxy is needed,
+    // and going through one adds latency and a dependency on it being alive.
+    // Only escalate to the configured proxy if IRCTC's edge WAF (Akamai)
+    // actually blocks the direct connection ("Access Denied ... you don't
+    // have permission ...").
+    private async Task InitializeWebViewAsync() => await SetupWebViewAsync(useProxy: false);
+
+    private async Task SetupWebViewAsync(bool useProxy)
     {
         var dataFolder = GetWebView2UserDataFolder();
         try
@@ -90,24 +97,30 @@ public class BookingManagerForm : Form
             };
 
             var envOptions = new CoreWebView2EnvironmentOptions();
-            var proxyArg = _proxy.GetProxyServerArg();
-            if (!string.IsNullOrEmpty(proxyArg))
+            if (useProxy)
             {
-                envOptions.AdditionalBrowserArguments = proxyArg;
+                var proxyArg = _proxy.GetProxyServerArg();
+                if (!string.IsNullOrEmpty(proxyArg))
+                {
+                    envOptions.AdditionalBrowserArguments = proxyArg;
+                }
             }
 
             var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
             await _webView.EnsureCoreWebView2Async(env);
 
-            // Load proxy auth extension AFTER profile is available
-            var extPath = ProxyConfig.EnsureAuthExtension(_proxy);
-            if (extPath != null && _webView.CoreWebView2?.Profile != null)
+            if (useProxy)
             {
-                try
+                // Load proxy auth extension AFTER profile is available
+                var extPath = ProxyConfig.EnsureAuthExtension(_proxy);
+                if (extPath != null && _webView.CoreWebView2?.Profile != null)
                 {
-                    await _webView.CoreWebView2.Profile.AddBrowserExtensionAsync(extPath);
+                    try
+                    {
+                        await _webView.CoreWebView2.Profile.AddBrowserExtensionAsync(extPath);
+                    }
+                    catch { /* Extension may already be loaded from a previous session */ }
                 }
-                catch { /* Extension may already be loaded from a previous session */ }
             }
 
             _webView.CoreWebView2?.Navigate("https://www.irctc.co.in/nget/train-search");
@@ -120,6 +133,31 @@ public class BookingManagerForm : Form
                 {
                     await Task.Delay(3000); // wait for Angular to render
                     await _webView.CoreWebView2.ExecuteScriptAsync(IrctcWebViewSession.HelperJs);
+
+                    bool blocked = await EvalBool(
+                        "__h.pageHas('Access Denied') && __h.pageHas('have permission')");
+                    if (blocked)
+                    {
+                        if (!useProxy && _proxy.IsConfigured)
+                        {
+                            await RetryWithProxyAsync();
+                        }
+                        else
+                        {
+                            MessageBox.Show(
+                                (useProxy
+                                    ? "IRCTC blocked this connection even through the configured proxy " +
+                                      "(Access Denied). This proxy likely can't reach IRCTC — try a " +
+                                      "different one, or clear the proxy to keep using direct access."
+                                    : "IRCTC blocked this connection (Access Denied) and no proxy is " +
+                                      "configured to retry through. Set one in the Proxy field above.")
+                                + "\n\nClose and reopen the Booking Manager window to retry the connection.",
+                                "IRCTC Access Denied",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Warning);
+                        }
+                        return;
+                    }
 
                     bool hasLogin = await EvalBool(
                         @"__h.exists('input[placeholder=""User Name""]') ||
@@ -150,6 +188,22 @@ public class BookingManagerForm : Form
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
         }
+    }
+
+    // Direct access got blocked by IRCTC's edge WAF. WebView2's proxy is
+    // fixed for the life of a browser process (can't be hot-swapped), so
+    // retrying through the proxy means tearing down this browser control and
+    // spinning up a fresh one in its place.
+    private async Task RetryWithProxyAsync()
+    {
+        var old = _webView;
+        _split.Panel2.Controls.Remove(old);
+        old.Dispose();
+
+        _webView = new WebView2 { Dock = DockStyle.Fill };
+        _split.Panel2.Controls.Add(_webView);
+
+        await SetupWebViewAsync(useProxy: true);
     }
 
     // ── UI construction ───────────────────────────────────────────────────

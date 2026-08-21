@@ -4,6 +4,15 @@ using System.Text.Json;
 
 namespace indian_ticketing;
 
+// Thrown when IRCTC's edge WAF (Akamai) returns its static "Access Denied"
+// block page instead of the real site — a signal to the caller to retry
+// through a proxy, not a generic failure.
+public class IrctcBlockedException : Exception
+{
+    public IrctcBlockedException()
+        : base("IRCTC blocked this connection (Access Denied / Akamai edge block).") { }
+}
+
 /// <summary>
 /// Automates the complete IRCTC booking workflow (Steps 1-10):
 ///   1  Open IRCTC + apply saved search filters + Search
@@ -83,66 +92,70 @@ true;";
     // ═══════════════════════════════════════════════════════════════════════
     //  ENTRY POINT
     // ═══════════════════════════════════════════════════════════════════════
+    private async Task EnsureCoreWebView2Async(bool useProxy = true)
+    {
+        if (_wv.CoreWebView2 != null) return;
+
+        var dataFolder = GetWebView2UserDataFolder();
+        Directory.CreateDirectory(dataFolder);
+
+        var envOptions = new CoreWebView2EnvironmentOptions();
+        var proxyArg = useProxy ? _proxy?.GetProxyServerArg() : null;
+        if (!string.IsNullOrEmpty(proxyArg))
+        {
+            envOptions.AdditionalBrowserArguments = proxyArg;
+            Report($"Proxy configured: {_proxy?.Host}:{_proxy?.Port} (auth: {_proxy?.HasCredentials})");
+        }
+
+        var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
+        _wv.CreationProperties = new CoreWebView2CreationProperties
+        {
+            UserDataFolder = dataFolder
+        };
+
+        await _wv.EnsureCoreWebView2Async(env);
+
+        // Auto-answer the native proxy-auth dialog ("Sign in to access this
+        // site") with the configured proxy credentials, so it never blocks
+        // the UI waiting for a manual Username/Password/Sign in.
+        if (useProxy && _proxy != null && _proxy.HasCredentials)
+        {
+            _wv.CoreWebView2.BasicAuthenticationRequested += (s, e) =>
+            {
+                e.Response.UserName = _proxy.Username;
+                e.Response.Password = _proxy.Password;
+            };
+        }
+
+        // Load proxy auth extension AFTER profile is available
+        if (useProxy && _proxy != null)
+        {
+            var extPath = ProxyConfig.EnsureAuthExtension(_proxy);
+            if (extPath != null && _wv.CoreWebView2?.Profile != null)
+            {
+                try
+                {
+                    await _wv.CoreWebView2.Profile.AddBrowserExtensionAsync(extPath);
+                    Report("Proxy auth extension loaded.");
+                }
+                catch
+                {
+                    Report("Proxy auth extension already loaded or failed (non-critical).");
+                }
+            }
+        }
+    }
+
     public async Task RunAsync(SavedBooking booking, string username, string password)
     {
         try
         {
-            if (_wv.CoreWebView2 == null)
-            {
-                var dataFolder = GetWebView2UserDataFolder();
-                Directory.CreateDirectory(dataFolder);
-
-                var envOptions = new CoreWebView2EnvironmentOptions();
-                var proxyArg = _proxy?.GetProxyServerArg();
-                if (!string.IsNullOrEmpty(proxyArg))
-                {
-                    envOptions.AdditionalBrowserArguments = proxyArg;
-                    Report($"Proxy configured: {_proxy?.Host}:{_proxy?.Port} (auth: {_proxy?.HasCredentials})");
-                }
-
-                var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
-                _wv.CreationProperties = new CoreWebView2CreationProperties
-                {
-                    UserDataFolder = dataFolder
-                };
-
-                await _wv.EnsureCoreWebView2Async(env);
-
-                // Auto-answer the native proxy-auth dialog ("Sign in to access this
-                // site") with the configured proxy credentials, so it never blocks
-                // the UI waiting for a manual Username/Password/Sign in.
-                if (_proxy != null && _proxy.HasCredentials)
-                {
-                    _wv.CoreWebView2.BasicAuthenticationRequested += (s, e) =>
-                    {
-                        e.Response.UserName = _proxy.Username;
-                        e.Response.Password = _proxy.Password;
-                    };
-                }
-
-                // Load proxy auth extension AFTER profile is available
-                if (_proxy != null)
-                {
-                    var extPath = ProxyConfig.EnsureAuthExtension(_proxy);
-                    if (extPath != null && _wv.CoreWebView2?.Profile != null)
-                    {
-                        try
-                        {
-                            await _wv.CoreWebView2.Profile.AddBrowserExtensionAsync(extPath);
-                            Report("Proxy auth extension loaded.");
-                        }
-                        catch
-                        {
-                            Report("Proxy auth extension already loaded or failed (non-critical).");
-                        }
-                    }
-                }
-            }
+            await EnsureCoreWebView2Async();
             _lastUser = username;
             _lastPass = password;
 
             // ── Step 1 — Open IRCTC and search (NO login yet) ─────────────
-            Report("Step 1 — C...");
+            Report("Step 1 — Opening IRCTC...");
             await NavAsync("https://www.irctc.co.in/nget/train-search");
             await D(1500); await InjectAsync();   // NavAsync already awaited load
 
@@ -178,24 +191,287 @@ true;";
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    //  TRAIN SEARCH (listing only — no login/booking). Runs the same search
+    //  form-fill Step 1 already uses (autocomplete stations, date, dropdowns),
+    //  then reads the results directly from IRCTC's own page instead of a
+    //  third-party feed (erail.in), so the list — and which classes each
+    //  train actually offers — always matches what IRCTC itself shows.
+    //
+    //  Known limitation: IRCTC's results list doesn't show live seat counts
+    //  per class up front (each class box just says "Refresh" until you open
+    //  it) — same limitation the erail.in feed had. This returns which
+    //  classes each train offers, not live WL/AVAILABLE numbers; those are
+    //  fetched during the actual booking flow (Steps 2-3). Day-of-run
+    //  (Mon..Sun) isn't populated — IRCTC's markup for that wasn't available
+    //  to confirm, so those columns are left blank rather than guessed.
+    // ═══════════════════════════════════════════════════════════════════════
+    // useProxy: false tries IRCTC direct first (the common case — no proxy
+    // dependency, less latency). Pass true to force the configured proxy,
+    // typically as a retry after catching IrctcBlockedException.
+    public async Task<List<TrainInfo>> SearchTrainsAsync(
+        string fromCode, string toCode, string date,
+        IProgress<string>? progress = null, bool useProxy = false)
+    {
+        if (progress != null) OnStatus += progress.Report;
+
+        await EnsureCoreWebView2Async(useProxy);
+
+        progress?.Report("Opening IRCTC...");
+        await NavAsync("https://www.irctc.co.in/nget/train-search");
+        await InjectAsync();
+        // Wait for the search form to actually be interactive rather than a
+        // blind fixed delay — this page's Angular hydration time varies
+        // enough that a short fixed wait sometimes fires before the From
+        // station input even exists yet (confirmed: querying it too early
+        // returns nothing to interact with).
+        await WaitForAsync("!!document.querySelector('p-autocomplete input')", 8000, pollMs: 200);
+        await InjectAsync();
+
+        // IRCTC's edge WAF (Akamai) blocks some IPs outright with a static
+        // "Access Denied ... you don't have permission ..." page instead of
+        // the real site — surface that distinctly so the caller can retry
+        // through a proxy instead of Step1_SearchAsync failing to find form
+        // fields on what is actually a block page, not IRCTC.
+        bool blocked = await ExecBool("__h.pageHas('Access Denied') && __h.pageHas('have permission')");
+        if (blocked) throw new IrctcBlockedException();
+
+        await DismissLanguageAlertAsync();
+
+        progress?.Report($"Searching {fromCode} → {toCode} on {date}...");
+        // "All Classes" / "GN" match Step1_SearchAsync's own skip conditions,
+        // so it fills from/to/date and searches without narrowing by class or
+        // quota — the same breadth erail.in's per-route feed gave us.
+        await Step1_SearchAsync(new SavedBooking
+        {
+            FromCode = fromCode, ToCode = toCode, JourneyDate = date,
+            TravelClass = "All Classes", Quota = "GN",
+        });
+
+        progress?.Report("Waiting for results...");
+        bool resultsReady = await WaitForAsync("!!document.querySelector('app-train-avl-enq')", 15000, pollMs: 300);
+        await D(700); await InjectAsync();   // let the rest of the list finish rendering
+
+        progress?.Report("Reading results from IRCTC...");
+        var raw = await Exec(ExtractTrainsJs);
+        var json = raw.Trim('"').Replace("\\\"", "\"").Replace("\\\\", "\\");
+
+        var trains = ParseIrctcTrains(json);
+        foreach (var t in trains) { t.From = fromCode; t.To = toCode; }
+
+        if (trains.Count == 0)
+        {
+            await ReportEmptySearchAsync(resultsReady);
+            progress?.Report("0 trains — see train_search_diag.json for why.");
+        }
+        else
+        {
+            progress?.Report($"{trains.Count} trains.");
+        }
+        return trains;
+    }
+
+    // Diagnostic for a search that came back with zero trains: dumps enough
+    // of the live page state to tell WHY — did the results panel never even
+    // render (resultsReady=false, e.g. station/date fill or Search click
+    // failed), or did it render but the header-parsing pattern just not
+    // match anything on this page.
+    private async Task ReportEmptySearchAsync(bool resultsReady)
+    {
+        var raw = await Exec(@"(function(){
+  var dlgTitle = document.querySelector('.ui-dialog-title');
+  var searchBtn = Array.from(document.querySelectorAll('button')).find(function(b){
+    return (b.innerText||'').toUpperCase().indexOf('SEARCH') >= 0;
+  });
+  var jpForm = document.querySelector('.jp-form form');
+  var out = {
+    url: location.href,
+    resultsReady: null,
+    visibilityState: document.visibilityState,
+    documentHidden: document.hidden,
+    documentHasFocus: document.hasFocus(),
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    trainCardCount: document.querySelectorAll('app-train-avl-enq').length,
+    preAvlCount: document.querySelectorAll('.pre-avl').length,
+    fromVal: (document.querySelectorAll('p-autocomplete input')[0]||{}).value || '',
+    toVal:   (document.querySelectorAll('p-autocomplete input')[1]||{}).value || '',
+    dialogExists: !!dlgTitle,
+    dialogVisible: !!(dlgTitle && dlgTitle.offsetParent !== null),
+    dialogText: dlgTitle ? dlgTitle.innerText.trim() : '',
+    searchBtnExists: !!searchBtn,
+    searchBtnVisible: !!(searchBtn && searchBtn.offsetParent !== null),
+    searchBtnDisabled: !!(searchBtn && searchBtn.disabled),
+    formClasses: jpForm ? jpForm.className : '(no .jp-form form found)',
+    bodySnippet: (document.body.innerText||'').replace(/\s+/g,' ').slice(0, 800)
+  };
+  return JSON.stringify(out);
+})()");
+        var json = raw.Trim('"').Replace("\\\"", "\"").Replace("\\\\", "\\");
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var obj = new Dictionary<string, object?>();
+            foreach (var p in doc.RootElement.EnumerateObject())
+                obj[p.Name] = p.Value.ValueKind == JsonValueKind.String ? p.Value.GetString() : p.Value.GetRawText();
+            obj["resultsReady"] = resultsReady;
+
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "IndianTicketing");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "train_search_diag.json"),
+                JsonSerializer.Serialize(obj, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { /* diagnostic-only, never block the flow */ }
+    }
+
+    // Finds every train card via IRCTC's own component boundary
+    // (<app-train-avl-enq>, one per train — confirmed from live markup, far
+    // more reliable than scanning for header text). Per card:
+    //   - name/number from ".train-heading strong" ("NAME (NNNNN)")
+    //   - days of run from the "Runs On:" span's 7 child <span class="Y"|"N">
+    //   - dep/arr from the two VISIBLE ".time" elements (a hidden mobile-
+    //     layout duplicate of the same two also exists, hence the
+    //     offsetParent filter) and duration from ".line-hr"
+    //   - classes offered from each ".pre-avl" <strong> label
+    private const string ExtractTrainsJs = @"(function(){
+  var cards = Array.from(document.querySelectorAll('app-train-avl-enq'));
+  var trains = [];
+
+  cards.forEach(function(card){
+    var headEl = card.querySelector('.train-heading strong');
+    var headText = ((headEl && headEl.textContent) || '').replace(/\s+/g,' ').trim();
+    var m = /^(.*?)\s*\((\d{5})\)$/.exec(headText);
+    if (!m) return;
+
+    var runsOnEl = Array.from(card.querySelectorAll('span')).find(function(s){
+      return (s.textContent||'').indexOf('Runs On') >= 0;
+    });
+    var days = ['x','x','x','x','x','x','x'];
+    if (runsOnEl) {
+      var dSpans = Array.from(runsOnEl.querySelectorAll('span')).slice(0, 7);
+      if (dSpans.length === 7) {
+        days = dSpans.map(function(s){ return s.classList.contains('Y') ? 'Y' : 'x'; });
+      }
+    }
+
+    var timeEls = Array.from(card.querySelectorAll('.time')).filter(function(e){ return e.offsetParent!==null; });
+    var depTime = timeEls[0] ? (timeEls[0].textContent||'').replace(/[^\d:]/g,'') : '';
+    var arrTime = timeEls[1] ? (timeEls[1].textContent||'').replace(/[^\d:]/g,'') : '';
+
+    var durEl = Array.from(card.querySelectorAll('.line-hr')).find(function(e){ return e.offsetParent!==null; });
+    var dur = durEl ? (durEl.textContent||'').trim() : '';
+
+    var classes = Array.from(card.querySelectorAll('.pre-avl')).map(function(box){
+      var lbl = box.querySelector('strong');
+      return ((lbl && lbl.textContent) || '').trim();
+    }).filter(function(s){ return s.length>0; });
+
+    trains.push({
+      no: m[2], name: m[1].trim(),
+      dep: depTime, arr: arrTime, dur: dur,
+      days: days, classes: classes
+    });
+  });
+
+  return JSON.stringify(trains);
+})()";
+
+    private static List<TrainInfo> ParseIrctcTrains(string json)
+    {
+        var result = new List<TrainInfo>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            foreach (var el in doc.RootElement.EnumerateArray())
+            {
+                var classes = el.GetProperty("classes").EnumerateArray()
+                    .Select(c => c.GetString() ?? "").ToList();
+
+                var dep = el.GetProperty("dep").GetString() ?? "";
+                var arr = el.GetProperty("arr").GetString() ?? "";
+                var arrSame = true;
+                if (TimeSpan.TryParse(dep, out var dTs) && TimeSpan.TryParse(arr, out var aTs))
+                    arrSame = aTs >= dTs;
+
+                var days = el.GetProperty("days").EnumerateArray()
+                    .Select(d => d.GetString() ?? "x").ToList();
+                string DayFlag(int i) => i < days.Count ? days[i] : "x";
+
+                result.Add(new TrainInfo
+                {
+                    TrainNo    = el.GetProperty("no").GetString() ?? "",
+                    TrainName  = el.GetProperty("name").GetString() ?? "",
+                    DepTime    = dep,
+                    ArrTime    = arr,
+                    Duration   = el.GetProperty("dur").GetString() ?? "",
+                    Mon        = DayFlag(0),
+                    Tue        = DayFlag(1),
+                    Wed        = DayFlag(2),
+                    Thu        = DayFlag(3),
+                    Fri        = DayFlag(4),
+                    Sat        = DayFlag(5),
+                    Sun        = DayFlag(6),
+                    Avl1A      = ClassCodeOf(classes, "1A"),
+                    Avl2A      = ClassCodeOf(classes, "2A"),
+                    Avl3A      = ClassCodeOf(classes, "3A"),
+                    AvlCC      = ClassCodeOf(classes, "CC"),
+                    AvlSL      = ClassCodeOf(classes, "SL"),
+                    Avl2S      = ClassCodeOf(classes, "2S"),
+                    Avl3E      = ClassCodeOf(classes, "3E"),
+                    ArrSameDay = arrSame,
+                });
+            }
+        }
+        catch { /* malformed JSON — return whatever was parsed before the failure */ }
+        return result;
+    }
+
+    private static string ClassCodeOf(List<string> classLabels, string code)
+        => classLabels.Any(l => l.Contains($"({code})", StringComparison.OrdinalIgnoreCase)) ? code : "x";
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  STEP 1 (pre) — Dismiss the "Alert" language-selection popup, if IRCTC
     //  shows it right after the site loads, by choosing English.
     // ═══════════════════════════════════════════════════════════════════════
+    // "offsetParent!==null" matters here, not just querySelector — the
+    // dialog's title node can stay in the DOM (contributing to
+    // document.body.innerText) after being visually dismissed, so a text-
+    // only check can keep reporting it "present" long after it stopped
+    // blocking anything.
+    private const string AlertVisibleJs = @"(function(){
+  var title = document.querySelector('.ui-dialog-title');
+  return !!title && title.offsetParent!==null && title.innerText.trim().toUpperCase()==='ALERT';
+})()";
+
+    // Confirmed via direct CDP testing against the live site: this popup's
+    // appearance is genuinely non-deterministic — it can show immediately on
+    // load, only later mid-way through filling the search form, or not at
+    // all, and dismissing it once does not reliably prevent it reappearing.
+    // One observed run needed to be re-dismissed many times in a row before
+    // staying gone, so this retries persistently instead of a few times,
+    // re-verifying after every click rather than assuming success.
     private async Task DismissLanguageAlertAsync()
     {
-        bool present = await WaitForAsync(@"(function(){
-  var title = document.querySelector('.ui-dialog-title');
-  return !!title && title.innerText.trim().toUpperCase()==='ALERT';
-})()", 4000);
-        if (!present) return;
+        for (int attempt = 0; attempt < 10; attempt++)
+        {
+            // Faster polling (250ms) than WaitForAsync's default keeps the
+            // common "no popup" case cheap — it was previously a guaranteed
+            // 4s wait every single search even when nothing ever shows.
+            bool present = await WaitForAsync(AlertVisibleJs, attempt == 0 ? 2800 : 1000, pollMs: 250);
+            if (!present) return;
 
-        Report("Step 1 — Language popup detected, selecting English...");
-        bool clicked = await ClickText("button", "English");
-        if (!clicked)
+            Report($"Step 1 — Language popup detected, selecting English (attempt {attempt + 1})...");
+            // A direct DOM .click() rather than a coordinate-based CDP click:
+            // ClickAsync/ClickText report success as soon as the button is
+            // found and sized, even if the physical click coordinate is
+            // actually intercepted by the dialog's own backdrop — a direct
+            // .click() on the element can't be swallowed that way.
             await ClickDomAsync(
-                "Array.from(document.querySelectorAll('button')).find(function(e){return (e.innerText||'').trim()==='English';})");
-
-        await D(500); await InjectAsync();
+                "Array.from(document.querySelectorAll('button')).find(function(e){return (e.innerText||'').trim()==='English' && e.offsetParent!==null;})");
+            await D(250); await InjectAsync();
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -207,12 +483,13 @@ true;";
 
         // From station
         await ClickAsync("document.querySelectorAll('p-autocomplete input')[0]");
-        await D(250);
+        await D(150);
         await Exec($"__h.fill('p-autocomplete input', '{Esc(b.FromCode)}')");
         // wait for the autocomplete list to populate (polls, not a fixed sleep)
-        await WaitForAsync("__h.exists('.ui-autocomplete-list-item, li.p-autocomplete-item, li.ui-corner-all')", 3000);
-        await ClickAsync("document.querySelector('.ui-autocomplete-list-item, li.p-autocomplete-item, li.ui-corner-all')");
-        await D(400);
+        var fromItemJs = AutocompleteItemJs("origin", b.FromCode);
+        await WaitForAsync($"!!({fromItemJs})", 3000, pollMs: 200);
+        await ClickAsync(fromItemJs);
+        await D(250);
 
         // To station
         await Exec($@"(function(){{
@@ -223,9 +500,10 @@ true;";
   s.call(inp,'{Esc(b.ToCode)}');
   inp.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
 }})();");
-        await WaitForAsync("__h.exists('.ui-autocomplete-list-item, li.p-autocomplete-item')", 3000);
-        await ClickAsync("document.querySelector('.ui-autocomplete-list-item, li.p-autocomplete-item')");
-        await D(400);
+        var toItemJs = AutocompleteItemJs("destination", b.ToCode);
+        await WaitForAsync($"!!({toItemJs})", 3000, pollMs: 200);
+        await ClickAsync(toItemJs);
+        await D(250);
 
         // Date
         var dp = b.JourneyDate.Split('-');
@@ -241,7 +519,7 @@ true;";
   d.dispatchEvent(new Event('change',{{bubbles:true}}));
 }})();");
         }
-        await D(600);
+        await D(400);
 
         // Class filter (if a specific class was saved — "All Classes" is already
         // the page default, so leave it alone).
@@ -249,7 +527,7 @@ true;";
         {
             bool clsOk = await SelectDropdownAsync("journeyClass", 0, ClassKeyword(b.TravelClass));
             if (!clsOk) Report($"Step 1 — Could not select class '{b.TravelClass}', left at default.");
-            await D(300); await InjectAsync();
+            await D(250); await InjectAsync();
         }
 
         // Quota filter (GN/General is already the page default).
@@ -257,15 +535,43 @@ true;";
         {
             bool qOk = await SelectDropdownAsync("journeyQuota", 1, QuotaKeyword(b.Quota));
             if (!qOk) Report($"Step 1 — Could not select quota '{b.Quota}', left at default.");
-            await D(300); await InjectAsync();
+            await D(250); await InjectAsync();
         }
 
-        // Click Search
+        // The language "Alert" popup doesn't reliably appear (or disappear)
+        // on any fixed schedule — it can show up mid-way through filling the
+        // form, or reappear after being dismissed once, and a still-open
+        // modal intercepts the Search click entirely (the page just sits on
+        // the search form with no results ever loading). So this isn't a
+        // one-shot click: dismiss-then-click is retried against a real
+        // verification (results actually showing) rather than assumed to
+        // have worked.
         Report("Step 1 — Clicking Search Trains...");
-        await ClickText("button", "SEARCH");
-        // results load via AJAX; Step 2 polls for the train list, so a short
-        // settle is enough here (was a flat 7s).
-        await D(2000); await InjectAsync();
+        const string searchDoneJs =
+            "location.href.indexOf('train-list')>=0 || !!document.querySelector('app-train-avl-enq') || __h.pageHas('Results for')";
+        for (int attempt = 0; attempt < 6; attempt++)
+        {
+            if (await ExecBool(searchDoneJs)) break;
+
+            await DismissLanguageAlertAsync();
+            // Direct DOM .click() rather than the coordinate-based CDP click
+            // ClickText/ClickAsync use: this page carries ad iframes
+            // (googleads.g.doubleclick.net) that can sit on top of the
+            // button's screen position, silently swallowing a physical click
+            // at those coordinates while ClickAsync still reports success. A
+            // direct .click() on the element can't be intercepted that way.
+            bool clicked = await ClickDomAsync(
+                "Array.from(document.querySelectorAll('button')).find(function(b){return (b.innerText||'').toUpperCase().indexOf('SEARCH')>=0 && b.offsetParent!==null;})");
+            Report($"Step 1 — Search click found+fired: {clicked}");
+
+            // Poll for success rather than a blind fixed wait — Angular's
+            // route change is usually near-instant once the click actually
+            // lands, so this confirms success as soon as it happens instead
+            // of always paying the full settle window.
+            await WaitForAsync(searchDoneJs, 1500, pollMs: 200);
+            await InjectAsync();
+        }
+        await InjectAsync();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -317,7 +623,7 @@ true;";
   return Array.from(document.querySelectorAll('div,span,td'))
     .some(function(e){
       var t=(e.innerText||'').toUpperCase().trim();
-      return (t.startsWith('AVAIL')||t.startsWith('WL')||t==='TRAIN DEPARTED')
+      return (t.startsWith('AVAIL')||t.startsWith('WL')||t==='TRAIN DEPARTED'||t.includes('NOT AVAIL'))
           && e.offsetHeight<60;
     });
 })()", 10000);
@@ -502,6 +808,7 @@ true;";
         }
 
         await D(400); await InjectAsync();
+        await SelectCateringOptionAsync();
 
         // ── Continue Booking → leads to the PAYMENT-METHOD page ────────────
         // (BHIM/UPI selection happens on that next page, not here.)
@@ -862,6 +1169,7 @@ true;";
 
         if (!await ExecBool(onPaymentMethodsTextJs))
         {
+            await SelectCateringOptionAsync();
             Report("Step 8a — Clicking Continue (once) on Review page...");
             await ClickContinueAsync();
             // Single click only — then poll for the next page. No re-clicking.
@@ -883,6 +1191,44 @@ true;";
         Report($"Step 8b — clicked Continue (dom={dom}, cdp={cdp})");
 
         await D(1200); await InjectAsync();
+    }
+
+    // IRCTC added a "Catering Service Option*" dropdown that must have a
+    // value selected before Continue will proceed — clicking without it just
+    // shows a validation toast ("Please select your Catering Service
+    // Choice") and leaves the flow stuck on the same page forever, since
+    // Step 8a is deliberately a single click (never re-clicked, to avoid
+    // IRCTC's double-click rejection) with no logic to recover from a
+    // validation failure. This is an optional add-on unrelated to booking a
+    // plain ticket, so it picks a "no thanks"-style option if one exists,
+    // else just the first real (non-placeholder) option — whichever page
+    // this shows up on (seen on the review/continue page; called
+    // defensively after Step 6's passenger form too, in case IRCTC shows it
+    // there for some bookings).
+    private async Task SelectCateringOptionAsync()
+    {
+        bool handled = await ExecBool(@"(function(){
+  var sel = Array.from(document.querySelectorAll('select')).find(function(s){
+    return /catering/i.test(s.outerHTML) || /catering/i.test((s.closest('div')||{}).innerText||'');
+  });
+  if (!sel) return false;
+  if (sel.value && sel.selectedIndex > 0) return true; // already has a real selection
+
+  var opts = Array.from(sel.options);
+  var pick = opts.find(function(o){ return /\bno\b|not required|don.?t want|none/i.test(o.textContent||''); })
+          || opts.find(function(o, idx){ return idx>0 && (o.textContent||'').trim().length>0; });
+  if (!pick) return false;
+
+  sel.value = pick.value;
+  sel.dispatchEvent(new Event('change', {bubbles:true}));
+  return true;
+})()");
+
+        if (handled)
+        {
+            Report("Step 8 — Selected a Catering Service option (required by IRCTC to continue).");
+            await D(300); await InjectAsync();
+        }
     }
 
     // Click whatever visible button reads exactly "CONTINUE" (button > anchor > bar)
@@ -994,6 +1340,35 @@ true;";
       return t.includes('PAYMENT METHODS')
           && (t.includes('BHIM/ UPI/ USSD') || t.includes('BHIM/UPI/USSD'));
     })()";
+
+    // Picks the correct station-autocomplete suggestion for a code. Confirmed
+    // live (via direct CDP testing against irctc.co.in):
+    //  1. The dropdown's <li class="ui-autocomplete-list-item"> rows include
+    //     non-selectable section dividers ("----- Journeys -----" /
+    //     "----- Stations -----", marked by a ".disable-selection" child
+    //     span) and "recent journey" combo shortcuts (contain "➨", pick BOTH
+    //     from and to at once) — both carry the exact same list-item class as
+    //     a real single-station row, so clicking the first DOM match could
+    //     land on a divider or the wrong entry instead of the searched
+    //     station.
+    //  2. Each field's suggestion panel lives inside that field's own
+    //     <p-autocomplete id="origin"|"destination">. An UNSCOPED
+    //     document-wide query can match a stale leftover row from the OTHER
+    //     field's already-closed panel — reproduced live: filling "To" with
+    //     LTT matched a leftover "NEW DELHI - NDLS" row from the From field.
+    //     Scoping to the specific field's own panel fixes this.
+    // Filters dividers/journeys, then prefers the row whose text actually
+    // contains "- CODE" (falls back to the first real station row in that
+    // field's own panel if no exact code match is found).
+    private static string AutocompleteItemJs(string fieldId, string code) => $@"(function(){{
+  var scope = document.querySelector('#{fieldId} .ui-autocomplete-panel') || document.querySelector('#{fieldId}') || document;
+  var items = Array.from(scope.querySelectorAll('li.ui-autocomplete-list-item, li.p-autocomplete-item, li.ui-corner-all'));
+  var real = items.filter(function(li){{
+    return !li.querySelector('.disable-selection') && (li.textContent||'').indexOf('➨') < 0;
+  }});
+  var codeRe = new RegExp('-\\s*{code}\\b', 'i');
+  return real.find(function(li){{ return codeRe.test(li.textContent||''); }}) || real[0];
+}})()";
 
     // Finds the class-availability box for a specific train. Confirmed live
     // markup (via DevTools) for each class is:
@@ -1958,14 +2333,21 @@ true;";
 })();");
     }
 
-    private Task NavAsync(string url)
+    private async Task NavAsync(string url)
     {
         var tcs = new TaskCompletionSource<bool>();
         void H(object? s, CoreWebView2NavigationCompletedEventArgs e)
         { _wv.CoreWebView2.NavigationCompleted -= H; tcs.TrySetResult(true); }
         _wv.CoreWebView2.NavigationCompleted += H;
         _wv.CoreWebView2.Navigate(url);
-        return tcs.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(45));
+        }
+        catch (TimeoutException)
+        {
+            throw new TimeoutException($"Page load timed out after 45s: {url}");
+        }
     }
 
     private async Task InjectAsync()
@@ -1975,13 +2357,13 @@ true;";
     private async Task<bool> ExecBool(string js) => (await Exec(js)).Trim('"') is "true" or "1";
 
 
-    private async Task<bool> WaitForAsync(string js, int timeoutMs = 10000)
+    private async Task<bool> WaitForAsync(string js, int timeoutMs = 10000, int pollMs = 500)
     {
         var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
         while (DateTime.UtcNow < deadline)
         {
             try { if (await ExecBool(js)) return true; } catch { }
-            await D(500);
+            await D(pollMs);
         }
         return false;
     }
