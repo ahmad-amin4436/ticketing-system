@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -25,6 +26,12 @@ public partial class Form1 : Form
     // never inside the form's visible client area.
     private WebView2 _webView = new() { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
     private readonly ProxyConfig _proxy = ProxyConfig.Load();
+
+    // Serializes all use of _webView — both the From/To autocomplete's live
+    // station lookups and the actual train search drive the same background
+    // browser, and running two at once would mean two overlapping scripts
+    // typing into (and reading) the same page at the same time.
+    private readonly SemaphoreSlim _webViewGate = new(1, 1);
 
     // erail.in train-type colours
     private static readonly Color ColRajdhani  = Color.FromArgb(0xFF, 0x48, 0x0B);
@@ -53,6 +60,13 @@ public partial class Form1 : Form
 
         Controls.Add(_webView);
         _webView.BringToFront();
+
+        // Cold-starting WebView2 and loading IRCTC's search page is the
+        // single biggest cost in a station lookup — pay for it now, in the
+        // background, while the form is still opening and nobody has typed
+        // anything yet, instead of making the very first character typed
+        // into From/To wait for all of it.
+        _ = PrewarmStationLookupAsync();
     }
 
     // ── Autocomplete ─────────────────────────────────────────────────────────
@@ -92,11 +106,19 @@ public partial class Form1 : Form
         TextBox txt, Panel panel, ListBox list,
         Action<(string Name, string Code)?> setStation)
     {
+        CancellationTokenSource? debounceCts = null;
+
         txt.TextChanged += (_, _) =>
         {
             if (_suppressAC) return;
             setStation(null);
-            ShowSuggestions(txt, panel, list);
+
+            debounceCts?.Cancel();
+            var query = txt.Text.Trim();
+            if (query.Length < 2) { panel.Visible = false; return; }
+
+            debounceCts = new CancellationTokenSource();
+            _ = ShowLiveSuggestionsAsync(txt, panel, list, query, debounceCts.Token);
         };
 
         txt.KeyDown += (_, e) =>
@@ -128,19 +150,55 @@ public partial class Form1 : Form
         };
     }
 
-    private void ShowSuggestions(TextBox txt, Panel panel, ListBox list)
+    // Looks up suggestions from IRCTC's own live autocomplete (see
+    // IrctcWebViewSession.GetStationSuggestionsAsync) instead of a
+    // hardcoded local list, so results always match what the real site
+    // would offer. Debounced (300ms of no further typing) so a fast typist
+    // doesn't queue up a script execution per keystroke, and the result is
+    // dropped if the field's text has since changed or typing was cancelled.
+    private async Task ShowLiveSuggestionsAsync(
+        TextBox txt, Panel panel, ListBox list, string query, CancellationToken token)
     {
-        var q = txt.Text.Trim();
-        var results = StationData.Search(q).ToList();
+        try { await Task.Delay(300, token); }
+        catch (TaskCanceledException) { return; }
+        if (token.IsCancellationRequested || IsDisposed) return;
+
+        // Live lookups normally settle in ~1-1.5s, but the first one after a
+        // completed search (or the very first of the session) can take
+        // noticeably longer while the background browser gets back to
+        // IRCTC's search page — show a placeholder immediately so typing
+        // doesn't look like it did nothing, instead of leaving the box empty
+        // until the real results arrive.
+        ShowItems(txt, panel, list, new[] { "Searching IRCTC..." });
+
+        List<(string Name, string Code)> results;
+        await _webViewGate.WaitAsync(token);
+        try
+        {
+            if (token.IsCancellationRequested) return;
+            var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
+            results = await session.GetStationSuggestionsAsync(query);
+        }
+        catch (OperationCanceledException) { return; }
+        finally { _webViewGate.Release(); }
+
+        if (token.IsCancellationRequested || IsDisposed) return;
+        if (!txt.Text.Trim().Equals(query, StringComparison.OrdinalIgnoreCase)) return; // stale
+
         if (results.Count == 0) { panel.Visible = false; return; }
 
+        ShowItems(txt, panel, list, results.Select(r => $"{r.Name} ({r.Code})"));
+    }
+
+    private void ShowItems(TextBox txt, Panel panel, ListBox list, IEnumerable<string> items)
+    {
         list.Items.Clear();
-        foreach (var (name, code) in results)
-            list.Items.Add($"{name} ({code})");
+        list.Items.AddRange(items.Cast<object>().ToArray());
+        if (list.Items.Count == 0) { panel.Visible = false; return; }
 
         var pt  = txt.Parent!.PointToScreen(new Point(txt.Left, txt.Bottom));
         var fp  = PointToClient(pt);
-        int h   = Math.Min(results.Count * list.ItemHeight + 4, 200);
+        int h   = Math.Min(list.Items.Count * list.ItemHeight + 4, 200);
         panel.SetBounds(fp.X, fp.Y, Math.Max(txt.Width + 30, 260), h);
         panel.Visible = true;
         panel.BringToFront();
@@ -307,7 +365,27 @@ public partial class Form1 : Form
             lblStatus.Text = "Error.";
             MessageBox.Show(ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
-        finally { btnGetTrains.Enabled = true; }
+        finally
+        {
+            btnGetTrains.Enabled = true;
+            // A completed search leaves the WebView2 sitting on the results
+            // page, not train-search — get it back there now (off the UI
+            // thread's critical path) so the next From/To autocomplete
+            // lookup doesn't have to pay for that re-navigation itself.
+            _ = PrewarmStationLookupAsync();
+        }
+    }
+
+    private async Task PrewarmStationLookupAsync()
+    {
+        await _webViewGate.WaitAsync();
+        try
+        {
+            var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
+            await session.PrewarmSearchPageAsync();
+        }
+        catch { /* best-effort */ }
+        finally { _webViewGate.Release(); }
     }
 
     // Tries IRCTC direct first; if its edge WAF blocks the connection
@@ -318,26 +396,31 @@ public partial class Form1 : Form
     private async Task<List<TrainInfo>> SearchTrainsWithProxyFallbackAsync(
         string fromCode, string toCode, string date, IProgress<string> progress)
     {
+        await _webViewGate.WaitAsync();
         try
         {
-            var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
-            return await session.SearchTrainsAsync(fromCode, toCode, date, progress);
+            try
+            {
+                var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
+                return await session.SearchTrainsAsync(fromCode, toCode, date, progress);
+            }
+            catch (IrctcBlockedException) when (_proxy.IsConfigured)
+            {
+                progress.Report("IRCTC blocked direct access — retrying through proxy...");
+
+                var old = _webView;
+                Controls.Remove(old);
+                old.Dispose();
+
+                _webView = new WebView2 { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
+                Controls.Add(_webView);
+                _webView.BringToFront();
+
+                var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
+                return await session.SearchTrainsAsync(fromCode, toCode, date, progress, useProxy: true);
+            }
         }
-        catch (IrctcBlockedException) when (_proxy.IsConfigured)
-        {
-            progress.Report("IRCTC blocked direct access — retrying through proxy...");
-
-            var old = _webView;
-            Controls.Remove(old);
-            old.Dispose();
-
-            _webView = new WebView2 { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
-            Controls.Add(_webView);
-            _webView.BringToFront();
-
-            var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
-            return await session.SearchTrainsAsync(fromCode, toCode, date, progress, useProxy: true);
-        }
+        finally { _webViewGate.Release(); }
     }
 
     // ── Save Train button ─────────────────────────────────────────────────────

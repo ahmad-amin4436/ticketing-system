@@ -46,7 +46,7 @@ public class BookingManagerForm : Form
     public BookingManagerForm()
     {
         BuildUi();
-        _txtUser.Text = "SEJAL124";
+        _txtUser.Text = "SEJAL115";
         _txtPass.Text = "Radharani@89";
         // Load saved proxy config — display as HOST:PORT:USERNAME:PASSWORD
         if (_proxy.IsConfigured)
@@ -364,6 +364,15 @@ public class BookingManagerForm : Form
         popup.SetQr(bmp);
     }
 
+    // The QR that ShowQrPopup last showed has disappeared from the live
+    // page (payment completed, or the gateway moved on) — close the popup
+    // instead of leaving a stale "scan to pay" window open.
+    private void CloseQrPopup(SavedBooking b)
+    {
+        if (_qrPopups.TryGetValue(b, out var popup) && !popup.IsDisposed)
+            popup.Close();
+    }
+
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         foreach (var popup in _qrPopups.Values.ToList())
@@ -438,6 +447,7 @@ public class BookingManagerForm : Form
         _session = new IrctcWebViewSession(_webView, _proxy);
         _session.OnStatus  += msg => this.Invoke(() => card.SetStatus(msg));
         _session.OnQrReady += bmp => this.Invoke(() => { card.ShowQr(bmp); ShowQrPopup(booking, bmp); });
+        _session.OnQrGone  += ()  => this.Invoke(() => CloseQrPopup(booking));
 
         await _session.RunAsync(booking, u, p);
         card.SetBooking(false);
@@ -530,6 +540,7 @@ public class BookingManagerForm : Form
         _session = new IrctcWebViewSession(_webView, _proxy);
         _session.OnStatus  += msg => this.Invoke(() => c.SetStatus(msg));
         _session.OnQrReady += bmp => this.Invoke(() => { c.ShowQr(bmp); ShowQrPopup(b, bmp); });
+        _session.OnQrGone  += ()  => this.Invoke(() => CloseQrPopup(b));
 
         await _session.RunAsync(b, u, p);
         c.SetBooking(false);

@@ -43,6 +43,10 @@ public class IrctcWebViewSession
 
     public event Action<string>? OnStatus;
     public event Action<System.Drawing.Bitmap>? OnQrReady;
+    // Fired when the QR that OnQrReady last showed has disappeared from the
+    // live page (payment completed, or the gateway moved on) — the UI
+    // closes the matching QR popup window when this fires.
+    public event Action? OnQrGone;
 
     // ── JS helpers ────────────────────────────────────────────────────────
     internal const string HelperJs = @"
@@ -205,7 +209,9 @@ true;";
             await D(1500); await InjectAsync();   // NavAsync already awaited load
 
             await DismissLanguageAlertAsync();    // "Alert" Hindi/English popup, if shown
-            await DismissLoginPopupAsync();       // unsolicited LOGIN popup, if shown
+            // (Step1_SearchAsync checks for an unsolicited LOGIN popup itself,
+            // right at its own start — checking again here would just be the
+            // same check twice back-to-back with no page activity in between.)
 
             await Step1_SearchAsync(booking);           // search with saved filters
 
@@ -286,7 +292,8 @@ true;";
         }
 
         await DismissLanguageAlertAsync();
-        await DismissLoginPopupAsync();
+        // (Step1_SearchAsync checks for an unsolicited LOGIN popup itself,
+        // right at its own start — see comment in LoginAsync above.)
 
         progress?.Report($"Searching {fromCode} → {toCode} on {date}...");
         // "All Classes" / "GN" match Step1_SearchAsync's own skip conditions,
@@ -319,6 +326,160 @@ true;";
             progress?.Report($"{trains.Count} trains.");
         }
         return trains;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STATION SUGGESTIONS (Form1's From/To autocomplete) — queries IRCTC's
+    //  own live autocomplete widget instead of a hardcoded local station
+    //  list, so results always match what IRCTC itself would offer,
+    //  including stations added since this app was last updated. Confirmed
+    //  live (via CDP network capture) that IRCTC does NOT hit a network
+    //  endpoint per keystroke — the whole station list is bundled client-
+    //  side and filtered in-page — so this drives the real page's own input
+    //  and reads back its own suggestion panel rather than reverse-
+    //  engineering a private endpoint.
+    // ═══════════════════════════════════════════════════════════════════════
+    // Returns (as a bare JS expression, no wrapping quotes) the code of the
+    // first real (non-divider, non-"recent journey") row currently in the
+    // origin field's suggestion panel, or '' if none. Used both to capture a
+    // baseline before typing a new query and to detect when the panel has
+    // actually refreshed to match it.
+    private const string FirstStationCodeJs = @"(function(){
+  var panel = document.querySelector('#origin .ui-autocomplete-panel');
+  if (!panel || panel.offsetParent===null) return '';
+  var items = panel.querySelectorAll('li.ui-autocomplete-list-item, li.p-autocomplete-item, li.ui-corner-all');
+  for (var i=0; i<items.length; i++) {
+    var li = items[i];
+    if (li.querySelector('.disable-selection')) continue;
+    var t = (li.textContent||'').trim();
+    if (!t || t.indexOf('➨') >= 0) continue;
+    var m = t.split('\n')[0].match(/-\s*([A-Z0-9]{2,6})\b/);
+    if (m) return m[1];
+  }
+  return '';
+})()";
+
+    // After a train search completes, the WebView2 is left sitting on the
+    // train-list RESULTS page, not train-search — so the very next station
+    // lookup would otherwise have to pay for a full re-navigation (several
+    // seconds) before it could even start typing. Form1 calls this right
+    // after a search finishes (fire-and-forget, off the UI thread's
+    // critical path) to get the page back to train-search early, so by the
+    // time the user starts typing again the fast path below is already hot.
+    public async Task PrewarmSearchPageAsync()
+    {
+        try
+        {
+            await EnsureCoreWebView2Async(false);
+            if (await EnsureOnSearchPageAsync())
+            {
+                // Popups (language alert / login) only ever appear right
+                // after a fresh page load, never spontaneously on an
+                // already-loaded page — so only pay for checking them here,
+                // the one place a fresh load can actually happen.
+                await DismissLanguageAlertAsync();
+                await DismissLoginPopupAsync();
+            }
+        }
+        catch { /* best-effort — a real lookup will retry this anyway */ }
+    }
+
+    // Returns true if a fresh navigation to train-search was needed (i.e.
+    // the page wasn't already there) — callers use this to know whether
+    // it's worth checking for load-time popups (language alert, login) at
+    // all, since those never appear on an already-loaded page.
+    private async Task<bool> EnsureOnSearchPageAsync()
+    {
+        bool onSearchPage = await ExecBool(
+            "location.href.indexOf('train-search') >= 0 && !!document.querySelector('p-autocomplete input')");
+        if (onSearchPage) return false;
+
+        await NavAsync("https://www.irctc.co.in/nget/train-search");
+        await InjectAsync();
+        await WaitForAsync("!!document.querySelector('p-autocomplete input')", 8000, pollMs: 200);
+        await InjectAsync();
+        return true;
+    }
+
+    public async Task<List<(string Name, string Code)>> GetStationSuggestionsAsync(string query)
+    {
+        var q = query?.Trim() ?? "";
+        if (q.Length < 2) return new();
+
+        try
+        {
+            await EnsureCoreWebView2Async(false);
+            if (await EnsureOnSearchPageAsync())
+            {
+                await DismissLanguageAlertAsync();
+                await DismissLoginPopupAsync();
+            }
+
+            // Confirmed live (via CDP): the panel does NOT clear between
+            // queries — it keeps showing the PREVIOUS query's results for
+            // roughly 1s (sometimes longer) before IRCTC's own internal
+            // debounce actually re-filters, so reading the panel right after
+            // setting the input returns stale data, not "no results". Capture
+            // the current top result as a baseline and poll until it changes
+            // (or, on the very first query of a session, until anything at
+            // all appears) instead of trusting a fixed short delay.
+            var baselineRaw = await Exec(FirstStationCodeJs);
+            var baseline = baselineRaw.Trim('"');
+
+            // Reuse the ORIGIN field for both From/To lookups — a station is
+            // a station regardless of which field is asking, and this never
+            // touches the destination field the user may already have set.
+            await Exec($@"(function(){{
+  var inp = document.querySelectorAll('p-autocomplete input')[0];
+  if (!inp) return;
+  inp.focus();
+  var s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+  s.call(inp,'{Esc(q)}');
+  inp.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
+}})();");
+
+            bool settled = await WaitForAsync(
+                $"(function(){{ var c={FirstStationCodeJs}; return !!c && c!=={JsStr(baseline)}; }})()",
+                3000, pollMs: 150);
+            if (!settled) return new();
+
+            // Same divider/"recent journey" filtering already proven correct
+            // for AutocompleteItemJs — dividers carry a ".disable-selection"
+            // child, journey-combo rows contain "➨".
+            var raw = await Exec(@"(function(){
+  var scope = document.querySelector('#origin .ui-autocomplete-panel');
+  if (!scope) return '[]';
+  var items = Array.from(scope.querySelectorAll(
+    'li.ui-autocomplete-list-item, li.p-autocomplete-item, li.ui-corner-all'));
+  var out = [];
+  items.forEach(function(li){
+    if (li.querySelector('.disable-selection')) return;
+    var t = (li.textContent||'').trim();
+    if (!t || t.indexOf('➨') >= 0) return;
+    var firstLine = t.split('\n')[0];
+    var m = firstLine.match(/-\s*([A-Z0-9]{2,6})\b/);
+    if (!m) return;
+    var name = firstLine.slice(0, m.index).replace(/-\s*$/,'').trim();
+    if (!name) return;
+    out.push([name, m[1]]);
+  });
+  return JSON.stringify(out);
+})()");
+
+            var json = raw.Trim('"').Replace("\\\"", "\"").Replace("\\\\", "\\");
+            var pairs = JsonSerializer.Deserialize<List<List<string>>>(json);
+            if (pairs == null) return new();
+
+            // De-dupe by code — the panel can list the same station under
+            // both a "Journeys" combo row's tail and its own "Stations" row.
+            return pairs.Where(p => p.Count == 2)
+                        .Select(p => (Name: p[0], Code: p[1]))
+                        .GroupBy(p => p.Code)
+                        .Select(g => g.First())
+                        .Take(15)
+                        .ToList();
+        }
+        catch { return new(); }
     }
 
     // Diagnostic for a search that came back with zero trains: dumps enough
@@ -541,7 +702,12 @@ true;";
 
     private async Task DismissLoginPopupAsync()
     {
-        bool present = await WaitForAsync(LoginPopupVisibleJs, 1200, pollMs: 250);
+        // Short window: a real login modal renders essentially instantly, and
+        // the two call sites that matter for speed (Step1_SearchAsync's start
+        // and its search-click retry loop) both re-check this on every retry
+        // anyway, so a persistently-present popup still gets caught quickly
+        // without every search paying a long wait for the common "not there" case.
+        bool present = await WaitForAsync(LoginPopupVisibleJs, 400, pollMs: 150);
         if (!present) return;
 
         Report("Step 1 — Unsolicited login popup detected, closing it...");
@@ -1771,7 +1937,8 @@ true;";
             @"canvas[class*=""qr""], canvas[id*=""qr""], canvas.qrcode, " +
             @".qrImg, .qr_img, #qrImage, [class*=""qrcode""] img, [class*=""qrcode""] canvas, svg[class*=""qr""]";
 
-        bool clickedReveal = false;
+        bool clickedReveal    = false;
+        bool clickedQrElement = false;
 
         for (int attempt = 0; attempt < 120; attempt++)
         {
@@ -1787,22 +1954,45 @@ true;";
             }
 
             // 0) Some gateways show a placeholder with "Click here to pay through QR".
-            //    Click it ONCE to render the real scannable QR.
+            //    Click it ONCE to render the real scannable QR. Confirmed via a live
+            //    DOM dump (IRCTC's iPay UPI widget): this is a <span onclick=
+            //    "submitUpiQrForm()"> inside #PayByQrButton, and clicking it swaps
+            //    #blurredImg's src to the real QR asynchronously — so wait for
+            //    IRCTC's own ready signal (#canPayTxt "Scan & Pay" / #upiQrLoad
+            //    "Checking Payment Status" becoming visible) rather than guessing
+            //    how long that takes with a fixed delay.
             if (!clickedReveal)
             {
-                bool clicked = await ClickAsync(@"(function(){
-  var el = Array.from(document.querySelectorAll('div,span,a,p,button,img'))
+                // Precise match first (the exact element confirmed via live DOM
+                // dump: <span onclick="submitUpiQrForm()">), falling back to the
+                // broader text search for other gateway variants. A direct DOM
+                // .click() (not the coordinate-based click) — reliable regardless
+                // of exactly where this renders on the page.
+                bool clicked = await ClickDomAsync(@"
+  document.querySelector('[onclick*=""submitUpiQrForm""]') ||
+  Array.from(document.querySelectorAll('div,span,a,p,button,img'))
     .find(function(e){
        var t=(e.innerText||'')+' '+(e.getAttribute&&e.getAttribute('alt')||'');
        return /click here to pay through qr|click .*qr|tap .*qr|view qr/i.test(t)
               && e.offsetParent!==null;
-    });
-  return el || null;
-})()");
-                if (clicked) { clickedReveal = true; await D(2000); await InjectAsync(); }
+    })
+");
+                if (clicked)
+                {
+                    clickedReveal = true;
+                    await WaitForAsync(@"(function(){
+  var c = document.querySelector('#canPayTxt'), l = document.querySelector('#upiQrLoad');
+  return (c && c.offsetParent!==null) || (l && l.offsetParent!==null);
+})()", 10000, pollMs: 300);
+                    await InjectAsync();
+                }
             }
 
-            // 1) Try to grab the QR element's image/canvas source directly
+            // Try, in order: the QR element's own image/canvas source, a
+            // screenshot crop of that same element, then (last resort) the
+            // largest square-ish image/canvas on the page.
+            System.Drawing.Bitmap? candidate = null;
+
             var src = (await Exec($@"(function(){{
   var el = document.querySelector('{qrSelector.Replace("\"", "\\\"")}');
   if (!el) return '';
@@ -1810,38 +2000,133 @@ true;";
   return el.src || '';
 }})()")).Trim('"');
 
-            if (src.Length > 30 && src != "null")
+            // Known-fake fast path: IRCTC's placeholder image (confirmed via live
+            // DOM dump) is literally a static demo asset, "QR_Prakhar_Demo.png" —
+            // if the src still points at it, there's no point decoding/analyzing
+            // it as a candidate at all.
+            bool knownPlaceholder = src.Contains("QR_Prakhar_Demo", StringComparison.OrdinalIgnoreCase);
+
+            if (!knownPlaceholder && src.Length > 30 && src != "null")
             {
                 await D(1000);
-                var bmp = await CaptureQrBitmapAsync(src);
-                if (bmp != null)
+                candidate = await CaptureQrBitmapAsync(src);
+            }
+            if (!knownPlaceholder)
+            {
+                candidate ??= await CropQrFromScreenshotAsync(qrSelector);
+                candidate ??= await CropLargestSquareImageAsync();
+            }
+
+            if (candidate == null)
+            {
+                // Still the known placeholder (e.g. the reveal click didn't land,
+                // or the ready-signal wait above timed out) — try clicking the QR
+                // element itself directly as a recovery, same as the low-contrast
+                // fallback below.
+                if (knownPlaceholder && !clickedQrElement)
                 {
-                    Report("Step 10 — UPI QR code extracted! Scan to pay.");
-                    OnQrReady?.Invoke(bmp);
-                    return;
+                    Report("Step 10 — Still showing the placeholder QR — clicking it directly...");
+                    await ClickDomAsync($"document.querySelector('{qrSelector.Replace("\"", "\\\"")}')");
+                    clickedQrElement = true;
+                    await D(1500); await InjectAsync();
                 }
+                continue;
             }
 
-            // 2) QR element exists but not readable → crop it from a screenshot
-            var cropped = await CropQrFromScreenshotAsync(qrSelector);
-            if (cropped != null)
+            // Confirmed by direct observation on a live payment page: IRCTC's
+            // gateway first shows a flat, low-contrast GREY QR-shaped
+            // placeholder — clicking it (not a separate "click here" caption,
+            // the QR image itself) reveals the real, high-contrast
+            // black-and-white scannable QR. Tell them apart by pixel
+            // contrast rather than markup, since a real QR is (by scanning
+            // necessity) almost entirely pure black/white with very little
+            // mid-tone, while the placeholder is dominated by mid-grey.
+            if (LooksLikeRealQr(candidate))
             {
-                Report("Step 10 — UPI QR code extracted (cropped)! Scan to pay.");
-                OnQrReady?.Invoke(cropped);
+                Report("Step 10 — UPI QR code extracted! Scan to pay.");
+                OnQrReady?.Invoke(candidate);
+                await MonitorQrUntilGoneAsync(qrSelector);
                 return;
             }
 
-            // 3) Last resort: if the page clearly shows a QR/UPI gateway, crop the
-            //    largest square-ish image/canvas on the page (that's the QR).
-            var squareCrop = await CropLargestSquareImageAsync();
-            if (squareCrop != null)
+            candidate.Dispose();
+            if (!clickedQrElement)
             {
-                Report("Step 10 — UPI QR code extracted (square detect)! Scan to pay.");
-                OnQrReady?.Invoke(squareCrop);
-                return;
+                Report("Step 10 — QR looks like a placeholder — clicking it to reveal the real one...");
+                await ClickDomAsync($"document.querySelector('{qrSelector.Replace("\"", "\\\"")}')");
+                clickedQrElement = true;
+                await D(1500); await InjectAsync();
             }
         }
         Report("Step 10 — QR not auto-detected. Scan it in the browser to complete payment.");
+    }
+
+    // See the comment above where this is used: distinguishes a real,
+    // high-contrast black/white QR from a flat grey placeholder by sampling
+    // pixel luminance rather than relying on markup we have no live access
+    // to verify.
+    private static bool LooksLikeRealQr(System.Drawing.Bitmap bmp)
+    {
+        try
+        {
+            int w = bmp.Width, h = bmp.Height;
+            if (w < 20 || h < 20) return false;
+
+            int step = Math.Max(1, Math.Min(w, h) / 60); // ~60x60 samples max
+            int dark = 0, light = 0, mid = 0, total = 0;
+            for (int y = 0; y < h; y += step)
+            {
+                for (int x = 0; x < w; x += step)
+                {
+                    var c = bmp.GetPixel(x, y);
+                    int lum = (c.R + c.G + c.B) / 3;
+                    if (lum < 70) dark++;
+                    else if (lum > 195) light++;
+                    else mid++;
+                    total++;
+                }
+            }
+            if (total == 0) return false;
+
+            double midFrac   = (double)mid   / total;
+            double darkFrac  = (double)dark  / total;
+            double lightFrac = (double)light / total;
+
+            // A real QR is high-contrast black/white with very little
+            // mid-tone, and has a genuine mix of both dark AND light pixels
+            // (a flat grey placeholder is mostly mid-tone; a blank/loading
+            // image is mostly one extreme with almost none of the other).
+            return midFrac < 0.25 && darkFrac > 0.10 && lightFrac > 0.10;
+        }
+        catch { return true; } // fail open — don't block display on a detection bug
+    }
+
+    // After the real QR is shown, keep a light watch on the page so the
+    // popup can be closed automatically once IRCTC's own QR disappears
+    // (payment completed, or the gateway moved on) instead of leaving a
+    // stale "scan to pay" window open indefinitely.
+    private async Task MonitorQrUntilGoneAsync(string qrSelector)
+    {
+        const int maxChecks = 200; // ~200 * 3s = 10 minutes ≈ typical UPI session validity
+        for (int i = 0; i < maxChecks; i++)
+        {
+            await D(3000);
+            bool stillThere;
+            try
+            {
+                await InjectAsync();
+                stillThere = await ExecBool(
+                    $"!!document.querySelector('{qrSelector.Replace("\"", "\\\"")}')");
+            }
+            catch { stillThere = true; } // on error, assume nothing changed yet
+
+            if (!stillThere)
+            {
+                Report("Step 10 — QR is no longer shown on the page (payment likely completed) — closing popup.");
+                OnQrGone?.Invoke();
+                return;
+            }
+        }
     }
 
     // Find the largest near-square <img>/<canvas> on the page — on a UPI gateway
