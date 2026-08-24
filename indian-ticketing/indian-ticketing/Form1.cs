@@ -320,7 +320,7 @@ public partial class Form1 : Form
     {
         try
         {
-            var session = new IrctcWebViewSession(_webView, _proxy);
+            var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
             return await session.SearchTrainsAsync(fromCode, toCode, date, progress);
         }
         catch (IrctcBlockedException) when (_proxy.IsConfigured)
@@ -335,7 +335,7 @@ public partial class Form1 : Form
             Controls.Add(_webView);
             _webView.BringToFront();
 
-            var session = new IrctcWebViewSession(_webView, _proxy);
+            var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
             return await session.SearchTrainsAsync(fromCode, toCode, date, progress, useProxy: true);
         }
     }

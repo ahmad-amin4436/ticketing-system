@@ -85,42 +85,63 @@ public class BookingManagerForm : Form
     // have permission ...").
     private async Task InitializeWebViewAsync() => await SetupWebViewAsync(useProxy: false);
 
+    private static bool IsProfileLockError(Exception ex)
+        => ex is System.Runtime.InteropServices.COMException com && (uint)com.HResult == 0x8007139F;
+
+    private async Task InitCoreWebView2Async(string dataFolder, bool useProxy)
+    {
+        Directory.CreateDirectory(dataFolder);
+        _webView.CreationProperties = new CoreWebView2CreationProperties
+        {
+            UserDataFolder = dataFolder
+        };
+
+        var envOptions = new CoreWebView2EnvironmentOptions();
+        if (useProxy)
+        {
+            var proxyArg = _proxy.GetProxyServerArg();
+            if (!string.IsNullOrEmpty(proxyArg))
+            {
+                envOptions.AdditionalBrowserArguments = proxyArg;
+            }
+        }
+
+        var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
+        await _webView.EnsureCoreWebView2Async(env);
+
+        if (useProxy)
+        {
+            // Load proxy auth extension AFTER profile is available
+            var extPath = ProxyConfig.EnsureAuthExtension(_proxy);
+            if (extPath != null && _webView.CoreWebView2?.Profile != null)
+            {
+                try
+                {
+                    await _webView.CoreWebView2.Profile.AddBrowserExtensionAsync(extPath);
+                }
+                catch { /* Extension may already be loaded from a previous session */ }
+            }
+        }
+    }
+
     private async Task SetupWebViewAsync(bool useProxy)
     {
         var dataFolder = GetWebView2UserDataFolder();
         try
         {
-            Directory.CreateDirectory(dataFolder);
-            _webView.CreationProperties = new CoreWebView2CreationProperties
+            try
             {
-                UserDataFolder = dataFolder
-            };
-
-            var envOptions = new CoreWebView2EnvironmentOptions();
-            if (useProxy)
-            {
-                var proxyArg = _proxy.GetProxyServerArg();
-                if (!string.IsNullOrEmpty(proxyArg))
-                {
-                    envOptions.AdditionalBrowserArguments = proxyArg;
-                }
+                await InitCoreWebView2Async(dataFolder, useProxy);
             }
-
-            var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
-            await _webView.EnsureCoreWebView2Async(env);
-
-            if (useProxy)
+            catch (Exception ex) when (IsProfileLockError(ex))
             {
-                // Load proxy auth extension AFTER profile is available
-                var extPath = ProxyConfig.EnsureAuthExtension(_proxy);
-                if (extPath != null && _webView.CoreWebView2?.Profile != null)
-                {
-                    try
-                    {
-                        await _webView.CoreWebView2.Profile.AddBrowserExtensionAsync(extPath);
-                    }
-                    catch { /* Extension may already be loaded from a previous session */ }
-                }
+                // HRESULT 0x8007139F: another process still holds this profile
+                // folder's lock (a WebView2 child process left running after an
+                // abrupt stop — common while iterating via a debugger). Fall
+                // back to a fresh, uniquely named profile for this run instead
+                // of failing hard.
+                dataFolder = $"{dataFolder}-{DateTime.Now:yyyyMMddHHmmss}";
+                await InitCoreWebView2Async(dataFolder, useProxy);
             }
 
             _webView.CoreWebView2?.Navigate("https://www.irctc.co.in/nget/train-search");
@@ -138,12 +159,17 @@ public class BookingManagerForm : Form
                         "__h.pageHas('Access Denied') && __h.pageHas('have permission')");
                     if (blocked)
                     {
+                        // Record what happened (timestamp, URL, Akamai reference,
+                        // screenshot) — a troubleshooting aid, not a retry.
+                        var reference = await AccessDeniedDiagnostics.CaptureAsync(_webView.CoreWebView2, useProxy, _proxy);
+
                         if (!useProxy && _proxy.IsConfigured)
                         {
                             await RetryWithProxyAsync();
                         }
                         else
                         {
+                            var refLine = reference != null ? $"\n\nAkamai reference: {reference}" : "";
                             MessageBox.Show(
                                 (useProxy
                                     ? "IRCTC blocked this connection even through the configured proxy " +
@@ -151,6 +177,7 @@ public class BookingManagerForm : Form
                                       "different one, or clear the proxy to keep using direct access."
                                     : "IRCTC blocked this connection (Access Denied) and no proxy is " +
                                       "configured to retry through. Set one in the Proxy field above.")
+                                + refLine
                                 + "\n\nClose and reopen the Booking Manager window to retry the connection.",
                                 "IRCTC Access Denied",
                                 MessageBoxButtons.OK,

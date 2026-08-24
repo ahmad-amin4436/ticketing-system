@@ -9,8 +9,15 @@ namespace indian_ticketing;
 // through a proxy, not a generic failure.
 public class IrctcBlockedException : Exception
 {
-    public IrctcBlockedException()
-        : base("IRCTC blocked this connection (Access Denied / Akamai edge block).") { }
+    public string? AkamaiReference { get; }
+
+    public IrctcBlockedException(string? akamaiReference = null)
+        : base(akamaiReference != null
+            ? $"IRCTC blocked this connection (Access Denied / Akamai edge block). Reference: {akamaiReference}"
+            : "IRCTC blocked this connection (Access Denied / Akamai edge block).")
+    {
+        AkamaiReference = akamaiReference;
+    }
 }
 
 /// <summary>
@@ -79,14 +86,29 @@ window.__h = {
 };
 true;";
 
-    public IrctcWebViewSession(WebView2 wv, ProxyConfig? proxy = null) { _wv = wv; _proxy = proxy; }
+    private readonly string _profileFolderName;
 
-    private static string GetWebView2UserDataFolder()
+    // profileFolderName: WebView2 refuses to run two browser processes
+    // against the same user-data folder at once (fails with HRESULT
+    // 0x8007139F, "the group or resource is not in the correct state") —
+    // confirmed this is exactly what happens when Form1's search WebView2
+    // and BookingManagerForm's WebView2 both point at the same shared
+    // profile while both windows are open, which is the normal way this app
+    // gets used (Booking Manager opens from Form1 and both stay up). Callers
+    // that need an independent profile (Form1's search) should pass a
+    // distinct name; booking keeps the original shared one for backward
+    // compatibility with its existing login/session state.
+    public IrctcWebViewSession(WebView2 wv, ProxyConfig? proxy = null, string profileFolderName = "WebView2")
+    {
+        _wv = wv; _proxy = proxy; _profileFolderName = profileFolderName;
+    }
+
+    private string GetWebView2UserDataFolder()
     {
         return Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Indian Ticketing",
-            "WebView2");
+            _profileFolderName);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -97,6 +119,29 @@ true;";
         if (_wv.CoreWebView2 != null) return;
 
         var dataFolder = GetWebView2UserDataFolder();
+        try
+        {
+            await InitCoreWebView2Async(dataFolder, useProxy);
+        }
+        catch (Exception ex) when (IsProfileLockError(ex))
+        {
+            // HRESULT 0x8007139F: another process still holds this profile
+            // folder's lock (a WebView2 child process left running after an
+            // abrupt stop — common while iterating via a debugger — or any
+            // other transient file lock). Rather than fail hard, fall back
+            // to a fresh, uniquely named profile for this run instead of
+            // diagnosing exactly who's holding the old one.
+            Report("WebView2 profile was locked by another process — starting a fresh profile...");
+            dataFolder = $"{dataFolder}-{DateTime.Now:yyyyMMddHHmmss}";
+            await InitCoreWebView2Async(dataFolder, useProxy);
+        }
+    }
+
+    private static bool IsProfileLockError(Exception ex)
+        => ex is System.Runtime.InteropServices.COMException com && (uint)com.HResult == 0x8007139F;
+
+    private async Task InitCoreWebView2Async(string dataFolder, bool useProxy)
+    {
         Directory.CreateDirectory(dataFolder);
 
         var envOptions = new CoreWebView2EnvironmentOptions();
@@ -160,6 +205,7 @@ true;";
             await D(1500); await InjectAsync();   // NavAsync already awaited load
 
             await DismissLanguageAlertAsync();    // "Alert" Hindi/English popup, if shown
+            await DismissLoginPopupAsync();       // unsolicited LOGIN popup, if shown
 
             await Step1_SearchAsync(booking);           // search with saved filters
 
@@ -233,9 +279,14 @@ true;";
         // through a proxy instead of Step1_SearchAsync failing to find form
         // fields on what is actually a block page, not IRCTC.
         bool blocked = await ExecBool("__h.pageHas('Access Denied') && __h.pageHas('have permission')");
-        if (blocked) throw new IrctcBlockedException();
+        if (blocked)
+        {
+            var reference = await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, useProxy, _proxy);
+            throw new IrctcBlockedException(reference);
+        }
 
         await DismissLanguageAlertAsync();
+        await DismissLoginPopupAsync();
 
         progress?.Report($"Searching {fromCode} → {toCode} on {date}...");
         // "All Classes" / "GN" match Step1_SearchAsync's own skip conditions,
@@ -475,11 +526,39 @@ true;";
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 1 (pre) — Close an unsolicited LOGIN popup, if IRCTC shows one
+    //  while just searching. Plain search never requires being logged in
+    //  (only Tatkal quota does — handled separately), and a still-open login
+    //  modal sits on top of the page, swallowing clicks meant for the
+    //  autocomplete dropdown / Search button underneath it. Like the
+    //  language alert, this is non-deterministic — it may or may not appear
+    //  — so it's checked cheaply rather than waited on.
+    // ═══════════════════════════════════════════════════════════════════════
+    private const string LoginPopupVisibleJs = @"(function(){
+  var title = document.querySelector('.ui-dialog-title, .p-dialog-title');
+  return !!title && title.offsetParent!==null && title.innerText.trim().toUpperCase()==='LOGIN';
+})()";
+
+    private async Task DismissLoginPopupAsync()
+    {
+        bool present = await WaitForAsync(LoginPopupVisibleJs, 1200, pollMs: 250);
+        if (!present) return;
+
+        Report("Step 1 — Unsolicited login popup detected, closing it...");
+        await ClickDomAsync(@"Array.from(document.querySelectorAll(
+  '.ui-dialog-titlebar-close, .p-dialog-header-close, .p-dialog-header-icon'
+)).find(function(e){return e.offsetParent!==null;})");
+        await D(250); await InjectAsync();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  STEP 1 — Apply saved search filters and click Search
     // ═══════════════════════════════════════════════════════════════════════
     private async Task Step1_SearchAsync(SavedBooking b)
     {
         Report($"Step 1 — Searching {b.FromCode} → {b.ToCode} on {b.JourneyDate}...");
+
+        await DismissLoginPopupAsync();
 
         // From station
         await ClickAsync("document.querySelectorAll('p-autocomplete input')[0]");
@@ -521,17 +600,30 @@ true;";
         }
         await D(400);
 
-        // Class filter (if a specific class was saved — "All Classes" is already
-        // the page default, so leave it alone).
-        if (!string.IsNullOrEmpty(b.TravelClass) && b.TravelClass != "All Classes")
+        // Class filter — checks the LIVE dropdown text rather than assuming
+        // "All Classes" is the page default (see the quota comment below for
+        // why that assumption breaks).
+        var wantClassKw = ClassKeyword(b.TravelClass).ToUpper();
+        var currentClassText = (await DropdownLabelAsync("journeyClass")).ToUpper();
+        if (!string.IsNullOrEmpty(b.TravelClass) && !currentClassText.Contains(wantClassKw))
         {
             bool clsOk = await SelectDropdownAsync("journeyClass", 0, ClassKeyword(b.TravelClass));
             if (!clsOk) Report($"Step 1 — Could not select class '{b.TravelClass}', left at default.");
             await D(250); await InjectAsync();
         }
 
-        // Quota filter (GN/General is already the page default).
-        if (!string.IsNullOrEmpty(b.Quota) && b.Quota != "GN")
+        // Quota filter — checks the LIVE dropdown text instead of trusting
+        // "b.Quota == GN means it's already General". IRCTC's Angular app
+        // persists the last-used quota via localStorage in this browser
+        // profile, and this app reuses ONE persistent WebView2 profile
+        // across both the search and booking features — so a previous
+        // booking's Tatkal selection can silently become "the default" for
+        // a later plain search. Confirmed live: a search inherited Tatkal
+        // from an earlier booking, and Tatkal requires being logged in just
+        // to search, so it always returned zero trains.
+        var wantQuotaKw = QuotaKeyword(b.Quota).ToUpper();
+        var currentQuotaText = (await DropdownLabelAsync("journeyQuota")).ToUpper();
+        if (!string.IsNullOrEmpty(b.Quota) && !currentQuotaText.Contains(wantQuotaKw))
         {
             bool qOk = await SelectDropdownAsync("journeyQuota", 1, QuotaKeyword(b.Quota));
             if (!qOk) Report($"Step 1 — Could not select quota '{b.Quota}', left at default.");
@@ -554,6 +646,7 @@ true;";
             if (await ExecBool(searchDoneJs)) break;
 
             await DismissLanguageAlertAsync();
+            await DismissLoginPopupAsync();
             // Direct DOM .click() rather than the coordinate-based CDP click
             // ClickText/ClickAsync use: this page carries ad iframes
             // (googleads.g.doubleclick.net) that can sit on top of the
@@ -1967,6 +2060,18 @@ true;";
     // is opened (they're rendered into an overlay on demand) — so unlike a
     // native <select>, we must open the dropdown first, wait for its panel,
     // then click the item whose text matches. formControlName is tried first
+    // Reads a p-dropdown's currently displayed label text (e.g. "GENERAL",
+    // "All Classes") by formcontrolname, so callers can check what's
+    // actually selected right now instead of assuming a fixed page default.
+    private async Task<string> DropdownLabelAsync(string formControlName)
+    {
+        var raw = await Exec($@"(function(){{
+  var d = document.querySelector('p-dropdown[formcontrolname=""{formControlName}""] .ui-dropdown-label, p-dropdown[formcontrolname=""{formControlName}""] .p-dropdown-label');
+  return d ? d.innerText.trim() : '';
+}})()");
+        return raw.Trim('"');
+    }
+
     // (stable, since it's a literal template attribute); positionalIndex is
     // the fallback rank among all <p-dropdown> elements on the page.
     private async Task<bool> SelectDropdownAsync(string formControlName, int positionalIndex, string keyword)
