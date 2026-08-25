@@ -30,6 +30,7 @@ public class BookingManagerForm : Form
     private readonly Button         _btnStartAll = new();
     private readonly Button         _btnRefresh  = new();
     private readonly Button         _btnSaveProxy = new();
+    private readonly Button         _btnToggleProxy = new();
     private readonly FlowLayoutPanel _cardPanel  = new();
     private WebView2                _webView     = new();
 
@@ -38,6 +39,10 @@ public class BookingManagerForm : Form
     private readonly List<BookingCard> _cards   = new();
     private IrctcWebViewSession?       _session;
     private readonly ProxyConfig       _proxy   = ProxyConfig.Load();
+    // Tracks which network mode _webView is actually running on right now —
+    // set by SetupWebViewAsync — so a session created for booking can label
+    // its own Access-Denied diagnostics correctly (direct vs proxy).
+    private bool                       _usingProxy;
 
     // One reusable QR popup window per booking — a refreshed QR replaces the
     // image in the existing window instead of opening a new one.
@@ -78,12 +83,14 @@ public class BookingManagerForm : Form
         catch { return false; }
     }
 
-    // Always try IRCTC direct first — most of the time no proxy is needed,
-    // and going through one adds latency and a dependency on it being alive.
-    // Only escalate to the configured proxy if IRCTC's edge WAF (Akamai)
+    // Honor an explicit "Proxy: ON" left from a previous session (set via the
+    // toggle button or Set) as the starting mode. Otherwise, default to
+    // trying IRCTC direct first — most of the time no proxy is needed, and
+    // going through one adds latency and a dependency on it being alive —
+    // and only escalate to the configured proxy if IRCTC's edge WAF (Akamai)
     // actually blocks the direct connection ("Access Denied ... you don't
     // have permission ...").
-    private async Task InitializeWebViewAsync() => await SetupWebViewAsync(useProxy: false);
+    private async Task InitializeWebViewAsync() => await SetupWebViewAsync(useProxy: _proxy.IsConfigured);
 
     private static bool IsProfileLockError(Exception ex)
         => ex is System.Runtime.InteropServices.COMException com && (uint)com.HResult == 0x8007139F;
@@ -91,10 +98,15 @@ public class BookingManagerForm : Form
     private async Task InitCoreWebView2Async(string dataFolder, bool useProxy)
     {
         Directory.CreateDirectory(dataFolder);
-        _webView.CreationProperties = new CoreWebView2CreationProperties
-        {
-            UserDataFolder = dataFolder
-        };
+        // No CreationProperties assignment here: it's only consulted by the
+        // control's OWN implicit init path, and only if set BEFORE the
+        // control gets a window handle (i.e. before it's added to a visible
+        // parent) — by the time this runs, _webView is already parented, so
+        // WebView2 has already begun its own init and setting this now
+        // throws "CreationProperties cannot be modified after the
+        // initialization of CoreWebView2 has begun." Passing an explicit
+        // environment to EnsureCoreWebView2Async(env) below (which already
+        // has dataFolder baked in) makes this assignment unnecessary anyway.
 
         var envOptions = new CoreWebView2EnvironmentOptions();
         if (useProxy)
@@ -108,6 +120,21 @@ public class BookingManagerForm : Form
 
         var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
         await _webView.EnsureCoreWebView2Async(env);
+
+        // Auto-answer the native proxy-auth dialog ("Sign in to access this
+        // site") with the configured credentials, so it never blocks the UI
+        // waiting on a manual Username/Password/Sign in. IrctcWebViewSession
+        // already does this for the sessions IT initializes, but _webView is
+        // initialized directly by THIS form (booking sessions just reuse the
+        // already-created CoreWebView2), so it needs its own subscription too.
+        if (useProxy && _proxy.HasCredentials)
+        {
+            _webView.CoreWebView2.BasicAuthenticationRequested += (s, e) =>
+            {
+                e.Response.UserName = _proxy.Username;
+                e.Response.Password = _proxy.Password;
+            };
+        }
 
         if (useProxy)
         {
@@ -126,6 +153,7 @@ public class BookingManagerForm : Form
 
     private async Task SetupWebViewAsync(bool useProxy)
     {
+        _usingProxy = useProxy;
         var dataFolder = GetWebView2UserDataFolder();
         try
         {
@@ -197,7 +225,7 @@ public class BookingManagerForm : Form
                         var p = _txtPass.Text.Trim();
                         if (!string.IsNullOrEmpty(u) && !string.IsNullOrEmpty(p))
                         {
-                            _session = new IrctcWebViewSession(_webView, _proxy);
+                            _session = new IrctcWebViewSession(_webView, _proxy, usingProxy: _usingProxy);
                             await _session.LoginAsync(u, p);
                         }
                     }
@@ -221,7 +249,12 @@ public class BookingManagerForm : Form
     // fixed for the life of a browser process (can't be hot-swapped), so
     // retrying through the proxy means tearing down this browser control and
     // spinning up a fresh one in its place.
-    private async Task RetryWithProxyAsync()
+    private async Task RetryWithProxyAsync() => await SwitchWebViewNetworkModeAsync(useProxy: true);
+
+    // Same constraint as above, generalized: switch the live browser between
+    // direct and proxy right here, without requiring the user to close and
+    // reopen the Booking Manager for a network-mode change to take effect.
+    private async Task SwitchWebViewNetworkModeAsync(bool useProxy)
     {
         var old = _webView;
         _split.Panel2.Controls.Remove(old);
@@ -230,7 +263,7 @@ public class BookingManagerForm : Form
         _webView = new WebView2 { Dock = DockStyle.Fill };
         _split.Panel2.Controls.Add(_webView);
 
-        await SetupWebViewAsync(useProxy: true);
+        await SetupWebViewAsync(useProxy);
     }
 
     // ── UI construction ───────────────────────────────────────────────────
@@ -275,10 +308,22 @@ public class BookingManagerForm : Form
         _btnSaveProxy.BackColor = Color.FromArgb(80, 80, 80);
         _btnSaveProxy.ForeColor = Color.White;
         _btnSaveProxy.FlatStyle = FlatStyle.Flat;
-        _btnSaveProxy.Click += (_, _) => SaveProxyFromTextBox();
+        _btnSaveProxy.Click += async (_, _) => await SaveProxyFromTextBoxAsync();
+
+        // Enable/Disable Proxy — switches the live browser between direct
+        // and proxy right here (no closing/reopening this window needed).
+        // Label reflects current state; UpdateProxyToggleButton keeps it in
+        // sync after every change (Set, toggle, or load).
+        _btnToggleProxy.Font      = new Font("Segoe UI", 8F, FontStyle.Bold);
+        _btnToggleProxy.Location  = new Point(882, 10);
+        _btnToggleProxy.Size      = new Size(90, 28);
+        _btnToggleProxy.FlatStyle = FlatStyle.Flat;
+        _btnToggleProxy.ForeColor = Color.White;
+        _btnToggleProxy.Click    += async (_, _) => await ToggleProxyAsync();
+        UpdateProxyToggleButton();
 
         _btnStartAll.Font      = new Font("Segoe UI", 9F, FontStyle.Bold);
-        _btnStartAll.Location  = new Point(882, 10);
+        _btnStartAll.Location  = new Point(978, 10);
         _btnStartAll.Size      = new Size(130, 28);
         _btnStartAll.Text      = "Start All Bookings";
         _btnStartAll.BackColor = Color.FromArgb(0, 110, 200);
@@ -287,7 +332,7 @@ public class BookingManagerForm : Form
         _btnStartAll.Click    += (_, _) => StartAllBookings();
 
         _btnRefresh.Font      = new Font("Segoe UI", 9F);
-        _btnRefresh.Location  = new Point(1018, 10);
+        _btnRefresh.Location  = new Point(1114, 10);
         _btnRefresh.Size      = new Size(70, 28);
         _btnRefresh.Text      = "Refresh";
         _btnRefresh.UseVisualStyleBackColor = true;
@@ -295,7 +340,7 @@ public class BookingManagerForm : Form
 
         _topBar.Controls.AddRange(new Control[] {
             _lblTitle, _lblUser, _txtUser, _lblPass, _txtPass,
-            _lblProxy, _txtProxy, _btnSaveProxy, _btnStartAll, _btnRefresh
+            _lblProxy, _txtProxy, _btnSaveProxy, _btnToggleProxy, _btnStartAll, _btnRefresh
         });
 
         // Split container — SplitterDistance set in Shown (layout is complete by then)
@@ -382,7 +427,7 @@ public class BookingManagerForm : Form
     }
 
     // ── Proxy config ──────────────────────────────────────────────────────
-    private void SaveProxyFromTextBox()
+    private async Task SaveProxyFromTextBoxAsync()
     {
         var text = _txtProxy.Text.Trim();
 
@@ -406,6 +451,8 @@ public class BookingManagerForm : Form
             _proxy.Host = ""; _proxy.Port = 0;
             _proxy.Username = ""; _proxy.Password = "";
             ProxyConfig.Save(_proxy);
+            UpdateProxyToggleButton();
+            await SwitchWebViewNetworkModeAsync(useProxy: false);
             MessageBox.Show("Proxy cleared. All requests will go direct.",
                 "Proxy", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
@@ -418,6 +465,8 @@ public class BookingManagerForm : Form
         _proxy.Username = parsed.Username;
         _proxy.Password = parsed.Password;
         ProxyConfig.Save(_proxy);
+        UpdateProxyToggleButton();
+        await SwitchWebViewNetworkModeAsync(useProxy: true);
 
         // Show diagnostic summary
         var diag = _proxy.DiagnosticSummary();
@@ -426,9 +475,31 @@ public class BookingManagerForm : Form
             diag += $"\n\nProxy auth extension will be loaded at browser startup.";
         }
 
-        MessageBox.Show($"{diag}\n\nNote: Proxy changes take effect for NEW browser sessions.\n" +
-            $"If a WebView2 session is already running, close and reopen the Booking Manager.",
-            "Proxy Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        MessageBox.Show(diag, "Proxy Saved — now active", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    // Flips Enabled without touching the saved host/port/credentials, so
+    // switching off and back on later doesn't require retyping the address.
+    private async Task ToggleProxyAsync()
+    {
+        if (!_proxy.Enabled && (string.IsNullOrWhiteSpace(_proxy.Host) || _proxy.Port <= 0))
+        {
+            MessageBox.Show("No proxy address is configured yet. Enter one in the Proxy field and click Set first.",
+                "Proxy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _proxy.Enabled = !_proxy.Enabled;
+        ProxyConfig.Save(_proxy);
+        UpdateProxyToggleButton();
+        await SwitchWebViewNetworkModeAsync(useProxy: _proxy.IsConfigured);
+    }
+
+    private void UpdateProxyToggleButton()
+    {
+        bool on = _proxy.IsConfigured;
+        _btnToggleProxy.Text      = on ? "Proxy: ON" : "Proxy: OFF";
+        _btnToggleProxy.BackColor = on ? Color.FromArgb(0, 150, 90) : Color.FromArgb(120, 120, 120);
     }
 
     // ── Booking logic ─────────────────────────────────────────────────────
@@ -444,7 +515,7 @@ public class BookingManagerForm : Form
         }
 
         card.SetBooking(true);
-        _session = new IrctcWebViewSession(_webView, _proxy);
+        _session = new IrctcWebViewSession(_webView, _proxy, usingProxy: _usingProxy);
         _session.OnStatus  += msg => this.Invoke(() => card.SetStatus(msg));
         _session.OnQrReady += bmp => this.Invoke(() => { card.ShowQr(bmp); ShowQrPopup(booking, bmp); });
         _session.OnQrGone  += ()  => this.Invoke(() => CloseQrPopup(booking));
@@ -537,7 +608,7 @@ public class BookingManagerForm : Form
         var c = _cards[index];
 
         c.SetBooking(true);
-        _session = new IrctcWebViewSession(_webView, _proxy);
+        _session = new IrctcWebViewSession(_webView, _proxy, usingProxy: _usingProxy);
         _session.OnStatus  += msg => this.Invoke(() => c.SetStatus(msg));
         _session.OnQrReady += bmp => this.Invoke(() => { c.ShowQr(bmp); ShowQrPopup(b, bmp); });
         _session.OnQrGone  += ()  => this.Invoke(() => CloseQrPopup(b));

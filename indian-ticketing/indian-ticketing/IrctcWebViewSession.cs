@@ -40,6 +40,12 @@ public class IrctcWebViewSession
     private string _lastUser = "";
     private string _lastPass = "";
     private readonly ProxyConfig? _proxy;
+    // Best-effort label for diagnostics only — reflects what the caller told
+    // us it set the underlying WebView2 up with, since a session created by
+    // BookingManagerForm reuses a browser that was already initialized
+    // (direct or proxy) before this session object existed, so this class
+    // can't observe that choice directly.
+    private readonly bool _usingProxy;
 
     public event Action<string>? OnStatus;
     public event Action<System.Drawing.Bitmap>? OnQrReady;
@@ -102,9 +108,10 @@ true;";
     // that need an independent profile (Form1's search) should pass a
     // distinct name; booking keeps the original shared one for backward
     // compatibility with its existing login/session state.
-    public IrctcWebViewSession(WebView2 wv, ProxyConfig? proxy = null, string profileFolderName = "WebView2")
+    public IrctcWebViewSession(
+        WebView2 wv, ProxyConfig? proxy = null, string profileFolderName = "WebView2", bool usingProxy = false)
     {
-        _wv = wv; _proxy = proxy; _profileFolderName = profileFolderName;
+        _wv = wv; _proxy = proxy; _profileFolderName = profileFolderName; _usingProxy = usingProxy;
     }
 
     private string GetWebView2UserDataFolder()
@@ -157,11 +164,13 @@ true;";
         }
 
         var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
-        _wv.CreationProperties = new CoreWebView2CreationProperties
-        {
-            UserDataFolder = dataFolder
-        };
-
+        // No CreationProperties assignment: it's only used by the control's
+        // own implicit init path (and only if set before it gets a window
+        // handle) — passing this explicit environment to
+        // EnsureCoreWebView2Async(env) below already carries dataFolder, so
+        // it's both unnecessary and (once _wv is already parented/handled)
+        // throws "CreationProperties cannot be modified after the
+        // initialization of CoreWebView2 has begun."
         await _wv.EnsureCoreWebView2Async(env);
 
         // Auto-answer the native proxy-auth dialog ("Sign in to access this
@@ -208,10 +217,32 @@ true;";
             await NavAsync("https://www.irctc.co.in/nget/train-search");
             await D(1500); await InjectAsync();   // NavAsync already awaited load
 
+            // This booking flow previously had NO Access-Denied check at all
+            // (unlike Form1's search, which does) — a block here meant every
+            // later step just failed with vague "not found"/timeout messages
+            // instead of a clear reason, and nothing was ever logged to
+            // AccessDeniedDiagnostics for this path. Check and stop cleanly.
+            bool blocked = await ExecBool("__h.pageHas('Access Denied') && __h.pageHas('have permission')");
+            if (blocked)
+            {
+                var reference = await AccessDeniedDiagnostics.CaptureAsync(
+                    _wv.CoreWebView2, _usingProxy, _proxy);
+                Report(reference != null
+                    ? $"IRCTC blocked this connection (Access Denied). Reference: {reference}. " +
+                      "Close and reopen the Booking Manager to retry (it tries direct first, then the " +
+                      "configured proxy if one is set)."
+                    : "IRCTC blocked this connection (Access Denied). Close and reopen the Booking Manager to retry.");
+                return;
+            }
+
             await DismissLanguageAlertAsync();    // "Alert" Hindi/English popup, if shown
+
+            // ── Step 0 — Log in FIRST, before touching the search form ─────
+            await Step0_LoginFirstAsync(username, password);
             // (Step1_SearchAsync checks for an unsolicited LOGIN popup itself,
-            // right at its own start — checking again here would just be the
-            // same check twice back-to-back with no page activity in between.)
+            // right at its own start, in case one shows up mid-form-fill even
+            // after this — checking again here would just be the same check
+            // twice back-to-back with no page activity in between.)
 
             await Step1_SearchAsync(booking);           // search with saved filters
 
@@ -955,6 +986,44 @@ true;";
             Report("Step 4 — Confirmation dialog: clicking Yes...");
             await ClickText("button", "YES");
             await D(1000); await InjectAsync();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 0 — Log in FIRST, before touching the search form at all.
+    //  Confirmed via user-provided DOM: the "LOGIN / REGISTER" link is
+    //  <a aria-label="Click here to Login in application">, which LoginAsync's
+    //  existing generic "LOGIN" text search already matches — no change
+    //  needed there, this just calls it earlier in the sequence. Doesn't
+    //  replace Step 5's re-login check below: IRCTC can still re-prompt
+    //  after Book Now regardless of an earlier login, so that stays as a
+    //  safety net (it's a fast no-op if the session is still authenticated).
+    // ═══════════════════════════════════════════════════════════════════════
+    private const string LoginLinkVisibleJs = @"(function(){
+  var a = document.querySelector('a[aria-label=""Click here to Login in application""]');
+  if (a && a.offsetParent!==null) return true;
+  var icon = document.querySelector('i.fa-user, .fa.fa-user');
+  return !!icon && icon.offsetParent!==null;
+})()";
+
+    private async Task Step0_LoginFirstAsync(string user, string pass)
+    {
+        bool loginLinkPresent = await ExecBool(LoginLinkVisibleJs);
+        if (!loginLinkPresent)
+        {
+            Report("Step 0 — Already logged in.");
+            return;
+        }
+
+        Report("Step 0 — Logging in before starting the search...");
+        try
+        {
+            await LoginAsync(user, pass);
+            await D(500); await InjectAsync();
+        }
+        catch (Exception ex)
+        {
+            Report($"Step 0 — Early login didn't complete ({ex.Message}); will retry after Book Now.");
         }
     }
 
@@ -2222,10 +2291,23 @@ true;";
     // ═══════════════════════════════════════════════════════════════════════
     public async Task LoginAsync(string user, string pass)
     {
-        // Open login dialog if not already open
+        // Open login dialog if not already open. Prefers the exact LOGIN
+        // link (confirmed via live DOM), then falls back to the "LOGIN" text
+        // search, then — confirmed via a separate live DOM dump — a plain
+        // user-icon (<i class="fa fa-user">) with no visible text at all,
+        // which the text-based searches above can't match on their own.
         if (!await ExecBool(@"__h.exists('input[placeholder=""User Name""]') || __h.exists('input[formcontrolname=""userid""]')"))
         {
-            await ClickText("a,button", "LOGIN");
+            bool clicked = await ClickDomAsync(@"
+  document.querySelector('a[aria-label=""Click here to Login in application""]')");
+            if (!clicked) clicked = await ClickText("a,button", "LOGIN");
+            if (!clicked)
+            {
+                await ClickDomAsync(@"(function(){
+  var icon = document.querySelector('i.fa-user, .fa.fa-user');
+  return icon ? (icon.closest('a,button') || icon) : null;
+})()");
+            }
             await D(2000); await InjectAsync();
         }
 
