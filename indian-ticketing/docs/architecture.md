@@ -52,7 +52,7 @@ flowchart LR
 [BookingManagerForm.cs](../indian-ticketing/BookingManagerForm.cs) owns:
 
 - A `SplitContainer`: left pane is a `FlowLayoutPanel` of `BookingCard`s (one per `SavedBooking`, loaded via `SavedBooking.LoadAll()`); right pane hosts the single `WebView2` control that actually navigates IRCTC.
-- IRCTC credentials and the proxy string as top-bar textboxes. **The username/password fields are pre-filled with a hardcoded literal in the constructor** — see [known-issues.md](known-issues.md).
+- IRCTC credentials and the proxy string as top-bar textboxes. They begin blank and are supplied at run time.
 - WebView2 initialization (`InitializeWebViewAsync`): creates a per-app `UserDataFolder` under `%LocalAppData%\Indian Ticketing\WebView2`, applies the proxy as a browser launch argument, loads the generated proxy-auth extension (see [data-and-config.md](data-and-config.md)), and navigates to the IRCTC search page. It also opportunistically auto-fills login if the login form is already showing.
 - `StartBooking` / `StartAllBookings` / `StartChain`: each spins up a **new** `IrctcWebViewSession` bound to the *same* `WebView2` instance and calls `RunAsync`. `StartAllBookings` chains bookings sequentially (each one waits for the previous `RunAsync` to complete before starting the next) — there is no parallelism, and all bookings share one browser tab/profile.
 - `_qrPopups`: a `Dictionary<SavedBooking, QrPopupForm>` so a re-triggered QR for the same booking updates an existing popup instead of spawning a new window.

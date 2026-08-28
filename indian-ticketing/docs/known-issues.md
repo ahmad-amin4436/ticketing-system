@@ -2,16 +2,9 @@
 
 Things a new contributor should know before touching this code.
 
-## Hardcoded IRCTC credentials in source
+## Historical credential exposure
 
-[BookingManagerForm.cs](../indian-ticketing/BookingManagerForm.cs) pre-fills the username/password textboxes with a literal account and password in the constructor:
-
-```csharp
-_txtUser.Text = "SEJAL108";
-_txtPass.Text = "Radharani@1719";
-```
-
-This means a real IRCTC account's password is committed to source control in plaintext and ships inside the built binary. If this repository (or the compiled app) is ever shared beyond its current owner, that credential is exposed. Recommended fix: remove the hardcoded default, leave the fields blank (or read from `ProxyConfig`-style local JSON/user secrets instead), and rotate the password on the IRCTC account since it's already in git history.
+Runtime defaults for IRCTC credentials and proxy settings have been removed. If prior revisions were committed or distributed with credentials, rotate them and remove them from repository history through the appropriate controlled process.
 
 ## Proxy credentials stored in plaintext
 
@@ -41,9 +34,10 @@ As detailed in [booking-automation.md](booking-automation.md), essentially every
 
 Steps 6b/8/9 in `IrctcWebViewSession` deliberately click Continue/Pay & Book **exactly once** and then poll for the next page, because IRCTC's backend rejects the whole transaction on a detected double-click. If you're adding retry logic to any click in that part of the flow, make sure it can't result in two activations of the same button — see [booking-automation.md](booking-automation.md#single-click-discipline) for the exact pattern already in place.
 
-## CAPTCHA OCR is best-effort, not guaranteed
+## CAPTCHA/challenge workflows require manual handling
 
-`AutoSolveCaptchaAsync` reads captchas with on-device Windows OCR and has no fallback to a human once its 8 attempts are exhausted — it proceeds with its last (possibly wrong) guess rather than pausing for manual entry. A wrong captcha guess here surfaces later as an unexplained "stuck" step rather than an explicit "captcha failed" status, so when the automation stalls right after a captcha-bearing page, check the status log for "Captcha ... rejected" messages first.
+The active WebView2 workflow intentionally stops when a CAPTCHA or browser
+challenge appears. It saves diagnostics under `%AppData%\IndianTicketing\automation_diagnostics`; complete the site's normal visible process before a new workflow is started.
 
 ## No automated tests
 

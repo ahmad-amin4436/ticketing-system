@@ -13,7 +13,7 @@ This is the engine actually used by the app (see [architecture.md](architecture.
 | 5 | `Step5_ReLoginAsync` | IRCTC re-prompts for login after Book Now; detect and fill it via `LoginAsync`. |
 | 6 | `Step6_PassengersAsync` | For each `Passenger`: add a passenger row (if not the first), fill name/age, select gender — each field is set-then-verified (see "Step-gate pattern" below). Then click Continue Booking. |
 | 6b | `Step6b_SelectPaymentMethodAsync` | On the payment-method page, select the BHIM/UPI radio option and click Continue **exactly once** (see "Single-click discipline"). |
-| 7 | `Step7_ResolveCaptchaAsync` | If a captcha is present, solve it automatically via OCR (`AutoSolveCaptchaAsync`) — no user interaction. |
+| 7 | `Step7_ResolveCaptchaAsync` | Detects a CAPTCHA/challenge, captures diagnostics, and stops the workflow for the site's normal manual process. |
 | 8 | `Step8_ContinueToReviewAsync` | Click Continue on the review/fare-summary page, then Continue again on the resulting Payment Methods page, waiting for each transition rather than re-clicking. |
 | 9 | `Step9_PayAndBookAsync` | Click "Pay & Book". Detects IRCTC's "Sorry!! please Try Again" rejection page and throws if it appears (no QR will ever come after that). |
 | 10 | `Step10_CaptureQrAsync` | Poll (up to 120 × 1.5s ≈ 3 minutes) for a UPI QR to render, extract it as a bitmap, and raise `OnQrReady`. |
@@ -50,17 +50,12 @@ Several comments call out a specific IRCTC behavior: **clicking "Continue" or "P
 
 If you're extending this flow, preserve that pattern — retrying a click here is not a safe default the way it is elsewhere in the codebase.
 
-## CAPTCHA solving (fully automatic, offline)
+## CAPTCHA and challenge handling
 
-`AutoSolveCaptchaAsync` (up to 8 attempts) never prompts the user. Per attempt:
-
-1. `OcrCaptchaAsync` pulls the captcha `<img>`'s `src` (usually a `data:image/jpg;base64,...` URI) out of the DOM.
-2. The image is preprocessed into three variants (`BuildCaptchaVariants`): auto-polarity threshold, forced-invert threshold, and plain upscaled grayscale (`PreprocessCaptchaImage` / `ScaleGrayscale`) — captchas can render as light-on-dark or dark-on-light, and thresholding picks the wrong polarity roughly half the time otherwise.
-3. Each variant is run through `Windows.Media.Ocr.OcrEngine` (WinRT, on-device, no network call, no external captcha-solving API).
-4. The candidate with a plausible length (4–8 chars) is kept; if none qualify, the captcha is refreshed (`RefreshCaptchaAsync`) and the loop retries.
-5. The winning text is typed character-by-character (dispatching real `keydown`/`input`/`keyup` per character) so Angular's reactive form registers it, then verified to have "landed" in the input before proceeding. If IRCTC's own "Invalid Captcha" message appears afterward, it refreshes and retries.
-
-If all attempts are exhausted, the code proceeds anyway with the last guess rather than blocking — later step verification (`WaitForAsync` for the next page) is what actually catches a failed captcha.
+When a CAPTCHA/challenge is detected, the active workflow captures redacted HTML,
+a screenshot, and a JSON diagnostic record, then stops. The application never
+reads, refreshes, enters, or retries a CAPTCHA. Complete the site's visible,
+normal challenge flow manually before beginning a new workflow.
 
 ## UPI QR capture (Step 10)
 

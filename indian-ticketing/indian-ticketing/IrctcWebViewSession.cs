@@ -5,8 +5,7 @@ using System.Text.Json;
 namespace indian_ticketing;
 
 // Thrown when IRCTC's edge WAF (Akamai) returns its static "Access Denied"
-// block page instead of the real site — a signal to the caller to retry
-// through a proxy, not a generic failure.
+// block page instead of the real site — a terminal, diagnosable failure.
 public class IrctcBlockedException : Exception
 {
     public string? AkamaiReference { get; }
@@ -18,6 +17,17 @@ public class IrctcBlockedException : Exception
     {
         AkamaiReference = akamaiReference;
     }
+}
+
+public class AutomationChallengeException : Exception
+{
+    public AutomationChallengeException() : base("A CAPTCHA or browser challenge requires manual completion.") { }
+}
+
+public class AutomationSiteFailureException : Exception
+{
+    public AutomationFailureKind Kind { get; }
+    public AutomationSiteFailureException(AutomationFailureKind kind) : base(AccessDeniedDiagnostics.UserMessage(kind)) => Kind = kind;
 }
 
 /// <summary>
@@ -225,13 +235,9 @@ true;";
             bool blocked = await ExecBool("__h.pageHas('Access Denied') && __h.pageHas('have permission')");
             if (blocked)
             {
-                var reference = await AccessDeniedDiagnostics.CaptureAsync(
-                    _wv.CoreWebView2, _usingProxy, _proxy);
-                Report(reference != null
-                    ? $"IRCTC blocked this connection (Access Denied). Reference: {reference}. " +
-                      "Close and reopen the Booking Manager to retry (it tries direct first, then the " +
-                      "configured proxy if one is set)."
-                    : "IRCTC blocked this connection (Access Denied). Close and reopen the Booking Manager to retry.");
+                await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2,
+                    AutomationFailureKind.AccessDenied, detail: "Booking workflow initial navigation", useProxy: _usingProxy, proxy: _proxy);
+                Report(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.AccessDenied));
                 return;
             }
 
@@ -258,7 +264,7 @@ true;";
             // ── Step 6b — Payment-method page: pick BHIM/UPI → Continue ───
             await Step6b_SelectPaymentMethodAsync();
 
-            // ── Step 7 — Auto-resolve captcha on next page ───────────────
+            // ── Step 7 — Stop for user-managed CAPTCHA/challenge ─────────
             await Step7_ResolveCaptchaAsync();
 
             // ── Step 8 — Click Continue → "Pay & Book" page ──────────────
@@ -270,7 +276,25 @@ true;";
             // ── Step 10 — Extract UPI QR and show in popup ───────────────
             await Step10_CaptureQrAsync();
         }
-        catch (Exception ex) { Report($"Error: {ex.Message}"); }
+        catch (AutomationSiteFailureException ex) { Report(ex.Message); }
+        catch (AutomationChallengeException ex)
+        {
+            await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, AutomationFailureKind.ChallengeOrCaptcha,
+                detail: ex.Message, useProxy: _usingProxy, proxy: _proxy);
+            Report(ex.Message);
+        }
+        catch (TimeoutException ex)
+        {
+            await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, AutomationFailureKind.Timeout,
+                detail: ex.Message, useProxy: _usingProxy, proxy: _proxy);
+            Report($"Timeout: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, AutomationFailureKind.Unknown,
+                detail: ex.Message, useProxy: _usingProxy, proxy: _proxy);
+            Report($"Error: {ex.Message}");
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -318,8 +342,9 @@ true;";
         bool blocked = await ExecBool("__h.pageHas('Access Denied') && __h.pageHas('have permission')");
         if (blocked)
         {
-            var reference = await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, useProxy, _proxy);
-            throw new IrctcBlockedException(reference);
+            await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, AutomationFailureKind.AccessDenied,
+                detail: "Train search", useProxy: useProxy, proxy: _proxy);
+            throw new IrctcBlockedException();
         }
 
         await DismissLanguageAlertAsync();
@@ -1448,7 +1473,7 @@ true;";
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 7 — Auto-resolve CAPTCHA on the next page (no human interaction)
+    //  STEP 7 — Stop when a CAPTCHA/challenge is presented
     // ═══════════════════════════════════════════════════════════════════════
     private async Task Step7_ResolveCaptchaAsync()
     {
@@ -1463,9 +1488,10 @@ true;";
             return;
         }
 
-        // Automatically read + enter the captcha (retries internally)
-        await AutoSolveCaptchaAsync();
-        await D(500); await InjectAsync();
+        await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, AutomationFailureKind.ChallengeOrCaptcha,
+            detail: "Booking workflow Step 7", useProxy: _usingProxy, proxy: _proxy);
+        Report(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.ChallengeOrCaptcha));
+        throw new AutomationChallengeException();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1480,7 +1506,7 @@ true;";
         // CRITICAL: IRCTC rejects the booking ("Sorry!! Please Try again" — reason:
         // "double clicked on any options/buttons") if Continue is clicked more than
         // once. So we click EXACTLY ONCE, then WAIT (poll) for the Payment Methods
-        // page — we never re-click. Solve captcha first if it's still up.
+        // page — we never re-click. A CAPTCHA/challenge stops the workflow.
         const string onPaymentMethodsTextJs = @"(function(){
    if (__h.captchaVisible()) return false;
    var t=(document.body.innerText||'').toUpperCase();
@@ -1491,9 +1517,7 @@ true;";
 })()";
 
         if (await ExecBool(@"__h.captchaVisible()"))
-        {
-            await AutoSolveCaptchaAsync(3); await D(400);
-        }
+            throw new AutomationChallengeException();
 
         if (!await ExecBool(onPaymentMethodsTextJs))
         {
@@ -2330,12 +2354,14 @@ true;";
             if (await ExecBool($"__h.fill('{sel}','{Esc(pass)}')")) break;
         await D(500);
 
-        // CAPTCHA on login page? — auto-solve it
+        // CAPTCHA/challenge on login page: leave it to the site's visible,
+        // user-operated flow; never read, refresh, or solve it automatically.
         if (await ExecBool("__h.captchaVisible() || __h.pageHas('Enter Captcha')"))
         {
-            Report("Login CAPTCHA — auto-solving...");
-            await AutoSolveCaptchaAsync();
-            await D(400);
+            await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, AutomationFailureKind.ChallengeOrCaptcha,
+                detail: "Login", useProxy: _usingProxy, proxy: _proxy);
+            Report(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.ChallengeOrCaptcha));
+            throw new AutomationChallengeException();
         }
 
         // Click SIGN IN
@@ -2536,285 +2562,18 @@ true;";
     // ═══════════════════════════════════════════════════════════════════════
     //  UTILITIES
     // ═══════════════════════════════════════════════════════════════════════
-    // ═══════════════════════════════════════════════════════════════════════
-    //  CAPTCHA AUTO-SOLVE — Windows OCR (no external service needed)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Tries up to <paramref name="maxAttempts"/> times to automatically read
-    /// the IRCTC image captcha using Windows OCR and enter the solution.
-    /// Falls back to asking the user only if all OCR attempts fail.
-    /// </summary>
-    // Fully autonomous captcha solver — NEVER asks the user.
-    // Reads the captcha, types it, and if rejected, refreshes and retries.
-    private async Task AutoSolveCaptchaAsync(int maxAttempts = 8)
-    {
-        for (int attempt = 1; attempt <= maxAttempts; attempt++)
-        {
-            await InjectAsync();
-
-            bool visible = await ExecBool(@"__h.captchaVisible()");
-            if (!visible) return; // captcha gone → solved/left page
-
-            Report($"Auto-solving CAPTCHA (attempt {attempt}/{maxAttempts})...");
-
-            var text = await OcrCaptchaAsync();
-
-            // Clean common OCR confusions; keep only plausible captcha chars
-            text = (text ?? "").Trim();
-
-            if (text.Length < 4 || text.Length > 8)
-            {
-                Report($"OCR '{text}' implausible — refreshing captcha...");
-                await RefreshCaptchaAsync();
-                await D(600);
-                continue;
-            }
-
-            Report($"OCR result: '{text}' — entering...");
-
-            // Type the captcha into the Angular reactive-form input (#captcha).
-            // Use the native value setter + per-character key events so Angular's
-            // FormControl registers the value (clears ng-pristine).
-            await Exec($@"(function(){{
-  var inp = document.querySelector(
-    'input#captcha, input[formcontrolname=""captcha""], input[name=""captcha""], input[placeholder*=""Captcha""]');
-  if (!inp) return;
-  var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
-  inp.focus();
-  inp.dispatchEvent(new Event('focus',{{bubbles:true}}));
-
-  // clear
-  setter.call(inp, '');
-  inp.dispatchEvent(new Event('input',{{bubbles:true}}));
-
-  // type char-by-char so Angular sees real keystrokes
-  var val = '{Esc(text)}';
-  for (var i=0;i<val.length;i++){{
-    var ch = val[i];
-    var cur = val.substring(0,i+1);
-    setter.call(inp, cur);
-    inp.dispatchEvent(new KeyboardEvent('keydown',{{key:ch,bubbles:true}}));
-    inp.dispatchEvent(new Event('input',{{bubbles:true}}));
-    inp.dispatchEvent(new KeyboardEvent('keyup',{{key:ch,bubbles:true}}));
-  }}
-  inp.dispatchEvent(new Event('change',{{bubbles:true}}));
-  inp.dispatchEvent(new Event('blur',{{bubbles:true}}));
-}})();");
-            await D(300);
-
-            // Verify the value actually landed in the input
-            var landed = (await Exec(
-                @"(document.querySelector('input#captcha,input[formcontrolname=""captcha""],input[name=""captcha""]')||{}).value || ''"))
-                .Trim('"');
-            if (!string.Equals(landed, text, StringComparison.OrdinalIgnoreCase))
-            {
-                Report($"Captcha value didn't stick ('{landed}') — retrying...");
-                await D(300);
-                continue;
-            }
-            await D(300);
-
-            // Check for rejection. If rejected, refresh + retry automatically.
-            bool invalid = await ExecBool(
-                "__h.pageHas('Invalid Captcha') || __h.pageHas('invalid captcha') " +
-                "|| __h.pageHas('incorrect captcha')");
-            if (invalid)
-            {
-                Report($"Captcha '{text}' rejected — fresh captcha + retry...");
-                await RefreshCaptchaAsync();
-                await D(700);
-                continue;
-            }
-            return; // accepted (or no error shown yet)
-        }
-
-        // Exhausted attempts — leave last guess entered; the caller's page-change
-        // verification will keep things moving. NO user prompt.
-        Report("Captcha auto-solve attempts exhausted — proceeding with last guess.");
-    }
-
-    private async Task<string> OcrCaptchaAsync()
-    {
-        try
-        {
-            // ── 1. Get captcha image bytes ────────────────────────────────
-            // IRCTC uses <img class=""captcha-img"" src=""data:image/jpg;base64,..."">
-            // The base64 src does NOT contain the word 'captcha', so match by class.
-            var src = (await Exec(@"(function(){
-  var img = document.querySelector(
-    'img.captcha-img, .captcha_div img, .captcha_mainDeiv img, img[alt*=""Captcha""], img[src*=""captcha""], img[id*=""captcha""]');
-  return img ? img.src : '';
-})()")).Trim('"');
-            if (string.IsNullOrEmpty(src)) return "";
-
-            byte[] bytes;
-            if (src.StartsWith("data:image", StringComparison.OrdinalIgnoreCase))
-            {
-                bytes = Convert.FromBase64String(src[(src.IndexOf(',') + 1)..]);
-            }
-            else
-            {
-                // Use WebView2 fetch to keep session cookies
-                var b64 = (await Exec($@"(async function(){{
-  try {{
-    var r = await fetch('{src}',{{credentials:'include'}});
-    var blob = await r.blob();
-    return await new Promise(function(ok){{
-      var fr = new FileReader(); fr.onload=function(){{ok(fr.result);}};
-      fr.readAsDataURL(blob);
-    }});
-  }} catch(e) {{ return ''; }}
-}})()")).Trim('"');
-                if (!b64.Contains(',')) return "";
-                bytes = Convert.FromBase64String(b64[(b64.IndexOf(',') + 1)..]);
-            }
-
-            using var ms = new System.IO.MemoryStream(bytes);
-            using var orig = new System.Drawing.Bitmap(ms);
-
-            var engine = Windows.Media.Ocr.OcrEngine.TryCreateFromLanguage(
-                            new Windows.Globalization.Language("en-US"))
-                       ?? Windows.Media.Ocr.OcrEngine.TryCreateFromUserProfileLanguages();
-            if (engine == null) return "";
-
-            // Run OCR on several preprocessing variants; keep the most plausible.
-            var candidates = new List<string>();
-            foreach (var variant in BuildCaptchaVariants(orig))
-            {
-                using (variant)
-                {
-                    using var pngMs = new System.IO.MemoryStream();
-                    variant.Save(pngMs, System.Drawing.Imaging.ImageFormat.Png);
-                    pngMs.Position = 0;
-
-                    var ras = pngMs.AsRandomAccessStream();
-                    var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(ras);
-                    var soft = await decoder.GetSoftwareBitmapAsync();
-                    var res  = await engine.RecognizeAsync(soft);
-
-                    var clean = new string(res.Text.Where(char.IsLetterOrDigit).ToArray());
-                    if (!string.IsNullOrWhiteSpace(clean)) candidates.Add(clean);
-                }
-            }
-
-            if (candidates.Count == 0) return "";
-
-            // Prefer a 4-8 char result (typical captcha length); else the longest.
-            var best = candidates
-                .OrderByDescending(c => (c.Length is >= 4 and <= 8) ? 1 : 0)
-                .ThenByDescending(c => c.Length)
-                .First();
-            return best;
-        }
-        catch { return ""; }
-    }
-
-    // Build a few preprocessing variants: auto-polarity, forced-invert, plain grayscale.
-    private static IEnumerable<System.Drawing.Bitmap> BuildCaptchaVariants(System.Drawing.Bitmap orig)
-    {
-        yield return PreprocessCaptchaImage(orig);            // auto-detect polarity
-        yield return PreprocessCaptchaImage(orig, forceInvert: true);
-        yield return ScaleGrayscale(orig);                    // no threshold, just upscale+gray
-    }
-
-    private static System.Drawing.Bitmap ScaleGrayscale(System.Drawing.Bitmap src)
-    {
-        const int scale = 4;
-        var wide = new System.Drawing.Bitmap(src.Width * scale, src.Height * scale);
-        using (var g = System.Drawing.Graphics.FromImage(wide))
-        {
-            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-            g.DrawImage(src, 0, 0, wide.Width, wide.Height);
-        }
-        for (int x = 0; x < wide.Width; x++)
-            for (int y = 0; y < wide.Height; y++)
-            {
-                var p = wide.GetPixel(x, y);
-                int l = (int)(p.R * 0.299 + p.G * 0.587 + p.B * 0.114);
-                wide.SetPixel(x, y, System.Drawing.Color.FromArgb(l, l, l));
-            }
-        return wide;
-    }
-
-    // Produce a clean black-text-on-white image for OCR.
-    // Auto-detects polarity: IRCTC captchas are often LIGHT text on a DARK
-    // background, which must be inverted (Windows OCR expects dark-on-light).
-    private static System.Drawing.Bitmap PreprocessCaptchaImage(
-        System.Drawing.Bitmap src, bool forceInvert = false)
-    {
-        const int scale = 4;
-        var wide = new System.Drawing.Bitmap(src.Width * scale, src.Height * scale);
-        using (var g = System.Drawing.Graphics.FromImage(wide))
-        {
-            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-            g.SmoothingMode     = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
-            g.DrawImage(src, 0, 0, wide.Width, wide.Height);
-        }
-
-        int w = wide.Width, h = wide.Height;
-
-        // 1) Compute luminance + average to estimate background brightness.
-        var lum = new int[w, h];
-        long total = 0;
-        for (int x = 0; x < w; x++)
-            for (int y = 0; y < h; y++)
-            {
-                var p = wide.GetPixel(x, y);
-                int l = (int)(p.R * 0.299 + p.G * 0.587 + p.B * 0.114);
-                lum[x, y] = l;
-                total += l;
-            }
-        double avg = total / (double)(w * h);
-
-        // If the image is mostly dark, the text is light → invert so text is dark.
-        // forceInvert flips whatever the auto-detection decided (used as a 2nd variant).
-        bool darkBackground = (avg < 128) ^ forceInvert;
-
-        // 2) Threshold around the mean (Otsu-lite) then output dark-on-white.
-        int threshold = (int)avg;
-        for (int x = 0; x < w; x++)
-            for (int y = 0; y < h; y++)
-            {
-                bool isTextPixel = darkBackground
-                    ? lum[x, y] > threshold    // light text on dark bg
-                    : lum[x, y] < threshold;   // dark text on light bg
-                wide.SetPixel(x, y, isTextPixel
-                    ? System.Drawing.Color.Black     // text → black
-                    : System.Drawing.Color.White);   // background → white
-            }
-        return wide;
-    }
-
-    private async Task RefreshCaptchaAsync()
-    {
-        // IRCTC refresh control: <a aria-label="Click to refresh Captcha">
-        //                          <span class="glyphicon glyphicon-repeat"></span></a>
-        await Exec(@"(function(){
-  // 1) the dedicated refresh anchor / glyphicon
-  var a = document.querySelector('a[aria-label*=""refresh Captcha""], a[aria-label*=""Refresh Captcha""]');
-  if (a) { a.click(); return; }
-  var g = document.querySelector('.glyphicon-repeat, .glyphicon-refresh');
-  if (g) { (g.closest('a,button')||g).click(); return; }
-  // 2) refresh-by-class fallback
-  var ref2 = document.querySelector('[class*=""refresh""],[id*=""refresh""]');
-  if (ref2) { ref2.click(); return; }
-  // 3) clicking the captcha image itself often reloads it
-  var img = document.querySelector('img.captcha-img, .captcha_div img');
-  if (img) img.click();
-})();");
-    }
-
     private async Task NavAsync(string url)
     {
-        var tcs = new TaskCompletionSource<bool>();
+        var tcs = new TaskCompletionSource<int>();
         void H(object? s, CoreWebView2NavigationCompletedEventArgs e)
-        { _wv.CoreWebView2.NavigationCompleted -= H; tcs.TrySetResult(true); }
+        { _wv.CoreWebView2.NavigationCompleted -= H; tcs.TrySetResult((int)e.HttpStatusCode); }
         _wv.CoreWebView2.NavigationCompleted += H;
         _wv.CoreWebView2.Navigate(url);
         try
         {
-            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(45));
+            var status = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(45));
+            var failure = await AccessDeniedDiagnostics.DetectAndCaptureAsync(_wv.CoreWebView2, status == 0 ? null : status, _usingProxy, _proxy);
+            if (failure != null) throw new AutomationSiteFailureException(failure.Value);
         }
         catch (TimeoutException)
         {

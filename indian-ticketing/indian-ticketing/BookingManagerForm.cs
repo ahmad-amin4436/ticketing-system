@@ -116,13 +116,8 @@ public class BookingManagerForm : Form
         catch { return false; }
     }
 
-    // Honor an explicit "Proxy: ON" left from a previous session (set via the
-    // toggle button or Set) as the starting mode. Otherwise, default to
-    // trying IRCTC direct first — most of the time no proxy is needed, and
-    // going through one adds latency and a dependency on it being alive —
-    // and only escalate to the configured proxy if IRCTC's edge WAF (Akamai)
-    // actually blocks the direct connection ("Access Denied ... you don't
-    // have permission ...").
+    // Use the explicitly configured network mode. A proxy is infrastructure
+    // configuration, never a fallback used to respond to an access block.
     private async Task InitializeWebViewAsync() => await SetupWebViewAsync(useProxy: _proxy.IsConfigured);
 
     private static bool IsProfileLockError(Exception ex)
@@ -205,45 +200,27 @@ public class BookingManagerForm : Form
                 await InitCoreWebView2Async(dataFolder, useProxy);
             }
 
-            _webView.CoreWebView2?.Navigate("https://www.irctc.co.in/nget/train-search");
+            var core = _webView.CoreWebView2;
+            if (core == null) throw new InvalidOperationException("WebView2 initialization did not produce a browser core.");
+            core.Navigate("https://www.irctc.co.in/nget/train-search");
 
             // Auto-fill login form if it appears on the initial page
-            _webView.CoreWebView2.NavigationCompleted += async (_, args) =>
+            core.NavigationCompleted += async (_, args) =>
             {
                 if (!args.IsSuccess) return;
                 try
                 {
                     await Task.Delay(3000); // wait for Angular to render
-                    await _webView.CoreWebView2.ExecuteScriptAsync(IrctcWebViewSession.HelperJs);
+                    await core.ExecuteScriptAsync(IrctcWebViewSession.HelperJs);
 
                     bool blocked = await EvalBool(
                         "__h.pageHas('Access Denied') && __h.pageHas('have permission')");
                     if (blocked)
                     {
-                        // Record what happened (timestamp, URL, Akamai reference,
-                        // screenshot) — a troubleshooting aid, not a retry.
-                        var reference = await AccessDeniedDiagnostics.CaptureAsync(_webView.CoreWebView2, useProxy, _proxy);
-
-                        if (!useProxy && _proxy.IsConfigured)
-                        {
-                            await RetryWithProxyAsync();
-                        }
-                        else
-                        {
-                            var refLine = reference != null ? $"\n\nAkamai reference: {reference}" : "";
-                            MessageBox.Show(
-                                (useProxy
-                                    ? "IRCTC blocked this connection even through the configured proxy " +
-                                      "(Access Denied). This proxy likely can't reach IRCTC — try a " +
-                                      "different one, or clear the proxy to keep using direct access."
-                                    : "IRCTC blocked this connection (Access Denied) and no proxy is " +
-                                      "configured to retry through. Set one in the Proxy field above.")
-                                + refLine
-                                + "\n\nClose and reopen the Booking Manager window to retry the connection.",
-                                "IRCTC Access Denied",
-                                MessageBoxButtons.OK,
-                                MessageBoxIcon.Warning);
-                        }
+                        await AccessDeniedDiagnostics.CaptureAsync(_webView.CoreWebView2,
+                            AutomationFailureKind.AccessDenied, detail: "Initial navigation", useProxy: useProxy, proxy: _proxy);
+                        MessageBox.Show(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.AccessDenied),
+                            "IRCTC Access Denied", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         return;
                     }
 
@@ -277,12 +254,6 @@ public class BookingManagerForm : Form
                 MessageBoxIcon.Error);
         }
     }
-
-    // Direct access got blocked by IRCTC's edge WAF. WebView2's proxy is
-    // fixed for the life of a browser process (can't be hot-swapped), so
-    // retrying through the proxy means tearing down this browser control and
-    // spinning up a fresh one in its place.
-    private async Task RetryWithProxyAsync() => await SwitchWebViewNetworkModeAsync(useProxy: true);
 
     // Same constraint as above, generalized: switch the live browser between
     // direct and proxy right here, without requiring the user to close and

@@ -4,14 +4,15 @@ Indian Ticketing is a Windows Forms (.NET 8) desktop app that:
 
 1. Searches trains on a route/date by scraping erail.in's public JSON-ish feed.
 2. Lets the user save one or more trains + a passenger list as a "booking" to a local JSON store.
-3. Drives an embedded WebView2 browser through the full IRCTC booking flow (login → search → select train → passengers → payment method → captcha → pay) to the point where a UPI QR code appears, which it captures and displays for the user to scan.
+3. Drives an embedded WebView2 browser through the booking flow using the site's visible, normal browser experience. If a CAPTCHA or challenge appears, it stops and preserves diagnostics rather than attempting to solve it.
 
 This folder documents the codebase for engineers picking up the project. Start with [architecture.md](architecture.md) for the big picture, then drill into the area you're touching.
 
 ## Contents
 
 - [architecture.md](architecture.md) — components, responsibilities, data flow, threading model.
-- [booking-automation.md](booking-automation.md) — how the WebView2 IRCTC automation engine works: the click primitives, step-gate pattern, captcha OCR, QR capture.
+- [booking-automation.md](booking-automation.md) — how the WebView2 IRCTC automation engine works: click primitives, step-gate pattern, challenge stop policy, and QR capture.
+- [authorized-automation.md](authorized-automation.md) — browser/session configuration, diagnostics, and the no-challenge-bypass policy.
 - [data-and-config.md](data-and-config.md) — persisted data models (`SavedBooking`, `ProxyConfig`), the erail.in feed format, station list.
 - [setup.md](setup.md) — prerequisites, build/run/publish, installer.
 - [known-issues.md](known-issues.md) — things a new contributor should know before changing code: hardcoded credentials, dead code, fragile scraping/automation assumptions.
@@ -44,4 +45,3 @@ indian-ticketing/                      solution root
 - **Microsoft.Web.WebView2** — embeds an Edge/Chromium browser inside `BookingManagerForm` for the live IRCTC automation.
 - **Selenium.WebDriver** — only used by the unused `IrctcBookingSession.cs` (see [known-issues.md](known-issues.md)).
 - **HtmlAgilityPack** — listed as a dependency but not currently referenced by any `.cs` file in the project (train search uses `HttpClient` + manual string splitting instead, see [data-and-config.md](data-and-config.md)).
-- **Windows.Media.Ocr** (WinRT) — local, offline CAPTCHA OCR; no third-party captcha-solving service is used.

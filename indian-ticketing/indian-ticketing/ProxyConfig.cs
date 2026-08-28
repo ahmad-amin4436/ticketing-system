@@ -26,18 +26,8 @@ public class ProxyConfig
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                      "IndianTicketing", "proxy_config.json");
 
-    // Default proxy for a fresh install (no saved config yet) — the one this
-    // app has been configured against throughout development. Still shown
-    // via the Proxy field / ON-OFF toggle, so it's just a starting point,
-    // not fixed in place.
-    private static ProxyConfig DefaultConfig() => new()
-    {
-        Enabled  = true,
-        Host     = "103.148.67.253",
-        Port     = 3128,
-        Username = "demo",
-        Password = "demo",
-    };
+    // A fresh installation never supplies a network endpoint or credentials.
+    private static ProxyConfig DefaultConfig() => new();
 
     // ── Persistence ──────────────────────────────────────────────────────
     public static ProxyConfig Load()

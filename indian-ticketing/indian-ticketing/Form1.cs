@@ -354,7 +354,7 @@ public partial class Form1 : Form
 
         try
         {
-            var trains = await SearchTrainsWithProxyFallbackAsync(fromCode, toCode, date, progress);
+            var trains = await SearchTrainsAsync(fromCode, toCode, date, progress);
             dgvTrains.DataSource = trains;
             lblStatus.Text = trains.Count > 0
                 ? $"{trains.Count} trains found  |  {fromCode} → {toCode}  |  {date}"
@@ -388,37 +388,17 @@ public partial class Form1 : Form
         finally { _webViewGate.Release(); }
     }
 
-    // Tries IRCTC direct first; if its edge WAF blocks the connection
-    // outright (IrctcBlockedException), tears down the background browser
-    // control and retries once through the configured proxy. WebView2's
-    // proxy is fixed for the life of a browser process, so a proxy retry
-    // needs a fresh control, not just a re-navigate.
-    private async Task<List<TrainInfo>> SearchTrainsWithProxyFallbackAsync(
+    // The configured proxy (if any) is used as normal infrastructure. A site
+    // block stops the search; this code never switches network identity after
+    // a security response.
+    private async Task<List<TrainInfo>> SearchTrainsAsync(
         string fromCode, string toCode, string date, IProgress<string> progress)
     {
         await _webViewGate.WaitAsync();
         try
         {
-            try
-            {
-                var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
-                return await session.SearchTrainsAsync(fromCode, toCode, date, progress);
-            }
-            catch (IrctcBlockedException) when (_proxy.IsConfigured)
-            {
-                progress.Report("IRCTC blocked direct access — retrying through proxy...");
-
-                var old = _webView;
-                Controls.Remove(old);
-                old.Dispose();
-
-                _webView = new WebView2 { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
-                Controls.Add(_webView);
-                _webView.BringToFront();
-
-                var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
-                return await session.SearchTrainsAsync(fromCode, toCode, date, progress, useProxy: true);
-            }
+            var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
+            return await session.SearchTrainsAsync(fromCode, toCode, date, progress, useProxy: _proxy.IsConfigured);
         }
         finally { _webViewGate.Release(); }
     }
