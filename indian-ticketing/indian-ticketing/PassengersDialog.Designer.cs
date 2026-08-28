@@ -17,14 +17,28 @@ partial class PassengersDialog
         SuspendLayout();
 
         // DataGridView
-        dgv.Location   = new System.Drawing.Point(8, 8);
-        dgv.Size       = new System.Drawing.Size(560, 220);
+        dgv.Location   = new System.Drawing.Point(12, 12);
+        dgv.Size       = new System.Drawing.Size(556, 220);
         dgv.AllowUserToAddRows    = true;
         dgv.AllowUserToDeleteRows = false;
         dgv.RowHeadersVisible     = false;
+        dgv.BorderStyle           = System.Windows.Forms.BorderStyle.None;
+        dgv.CellBorderStyle       = System.Windows.Forms.DataGridViewCellBorderStyle.SingleHorizontal;
+        dgv.ColumnHeadersBorderStyle = System.Windows.Forms.DataGridViewHeaderBorderStyle.None;
+        dgv.EnableHeadersVisualStyles = false;
+        dgv.BackgroundColor      = UiTheme.Background;
+        dgv.GridColor             = UiTheme.Border;
+        dgv.RowTemplate.Height    = 28;
         dgv.SelectionMode         = System.Windows.Forms.DataGridViewSelectionMode.FullRowSelect;
-        dgv.Font = new System.Drawing.Font("Segoe UI", 9F);
+        dgv.Font = UiTheme.FontBody;
         dgv.ColumnHeadersDefaultCellStyle.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
+        dgv.ColumnHeadersDefaultCellStyle.BackColor = UiTheme.Primary;
+        dgv.ColumnHeadersDefaultCellStyle.ForeColor = UiTheme.TextOnPrimary;
+        dgv.ColumnHeadersHeight   = 30;
+        dgv.DefaultCellStyle.BackColor          = UiTheme.Surface;
+        dgv.DefaultCellStyle.SelectionBackColor = UiTheme.PrimaryLight;
+        dgv.DefaultCellStyle.SelectionForeColor = UiTheme.TextOnPrimary;
+        dgv.AlternatingRowsDefaultCellStyle.BackColor = UiTheme.CardAlt;
 
         var colName   = new System.Windows.Forms.DataGridViewTextBoxColumn { HeaderText = "Name",   Width = 180, Name = "Name" };
         var colAge    = new System.Windows.Forms.DataGridViewTextBoxColumn { HeaderText = "Age",    Width = 55,  Name = "Age" };
@@ -44,27 +58,31 @@ partial class PassengersDialog
         dgv.Columns.AddRange(colName, colAge, colGender, colBerth);
 
         // Buttons
-        int by = 238;
-        btnAdd.Location = new System.Drawing.Point(8,   by); btnAdd.Size = new System.Drawing.Size(90, 28);
-        btnAdd.Text = "+ Add Row"; btnAdd.UseVisualStyleBackColor = true;
+        int by = 242;
+        btnAdd.Location = new System.Drawing.Point(12,  by); btnAdd.Size = new System.Drawing.Size(94, 30);
+        btnAdd.Text = "+ Add Row";
+        UiTheme.StyleSecondary(btnAdd);
         btnAdd.Click += new System.EventHandler(btnAdd_Click);
 
-        btnRemove.Location = new System.Drawing.Point(104, by); btnRemove.Size = new System.Drawing.Size(90, 28);
-        btnRemove.Text = "- Remove"; btnRemove.UseVisualStyleBackColor = true;
+        btnRemove.Location = new System.Drawing.Point(110, by); btnRemove.Size = new System.Drawing.Size(94, 30);
+        btnRemove.Text = "- Remove";
+        UiTheme.StyleSecondary(btnRemove);
         btnRemove.Click += new System.EventHandler(btnRemove_Click);
 
-        btnOk.Location = new System.Drawing.Point(396, by); btnOk.Size = new System.Drawing.Size(80, 28);
-        btnOk.Text = "OK"; btnOk.UseVisualStyleBackColor = true;
+        btnOk.Location = new System.Drawing.Point(394, by); btnOk.Size = new System.Drawing.Size(84, 30);
+        btnOk.Text = "OK";
+        UiTheme.StylePrimary(btnOk);
         btnOk.Click += new System.EventHandler(btnOk_Click);
 
-        btnCancel.Location = new System.Drawing.Point(482, by); btnCancel.Size = new System.Drawing.Size(80, 28);
+        btnCancel.Location = new System.Drawing.Point(484, by); btnCancel.Size = new System.Drawing.Size(84, 30);
         btnCancel.Text = "Cancel"; btnCancel.DialogResult = System.Windows.Forms.DialogResult.Cancel;
-        btnCancel.UseVisualStyleBackColor = true;
+        UiTheme.StyleSecondary(btnCancel);
 
         // Form
         AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
         AutoScaleMode       = System.Windows.Forms.AutoScaleMode.Font;
-        ClientSize          = new System.Drawing.Size(576, 276);
+        BackColor           = UiTheme.Surface;
+        ClientSize          = new System.Drawing.Size(580, 284);
         Controls.AddRange(new System.Windows.Forms.Control[] { dgv, btnAdd, btnRemove, btnOk, btnCancel });
         FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
         MaximizeBox     = false;

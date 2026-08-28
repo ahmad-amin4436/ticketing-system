@@ -14,6 +14,7 @@ partial class Form1
     {
         // ── controls ─────────────────────────────────────────────────────────
         pnlSearch    = new System.Windows.Forms.Panel();
+        pnlSearchBar = new System.Windows.Forms.Panel();
         // row-1 controls
         lblFromHdr   = new System.Windows.Forms.Label();
         chkFromOnly  = new System.Windows.Forms.CheckBox();
@@ -43,63 +44,70 @@ partial class Form1
         SuspendLayout();
 
         // ── pnlSearch ────────────────────────────────────────────────────────
-        pnlSearch.BackColor = System.Drawing.Color.FromArgb(248, 248, 248);
-        pnlSearch.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
-        pnlSearch.Dock   = System.Windows.Forms.DockStyle.Top;
-        pnlSearch.Height = 76;
+        // A plain white search "card" sitting on the app's light-grey
+        // background, with a single 1px accent rule along the bottom instead
+        // of a hard box border all the way round — reads as one clean panel
+        // instead of a boxed-in form control.
+        pnlSearch.BackColor = UiTheme.Surface;
+        pnlSearch.Dock      = System.Windows.Forms.DockStyle.Top;
+        pnlSearch.Height    = 96;
+        pnlSearch.Padding   = new System.Windows.Forms.Padding(0, 0, 0, 2);
         pnlSearch.Controls.AddRange(new System.Windows.Forms.Control[]
         {
             lblFromHdr, chkFromOnly, lblToHdr, chkToOnly,
             chkSortDate, chkFirstLast, cmbTrainType, btnGetTrains,
             txtFrom, btnSwap, txtTo, dtpDate, cmbQuota, cmbClass,
-            btnSaveTrain, btnBookingMgr
+            btnSaveTrain, btnBookingMgr, pnlSearchBar
         });
 
-        // ── ROW 1 ────────────────────────────────────────────────────────────
-        int y1 = 6;
+        pnlSearchBar.BackColor = UiTheme.Primary;
+        pnlSearchBar.Dock      = System.Windows.Forms.DockStyle.Bottom;
+        pnlSearchBar.Height    = 3;
 
-        // "From" label
+        // ── ROW 1 — labels, filters, and the primary "Get Trains" action ──────
+        int y1 = 10;
+
         lblFromHdr.AutoSize  = true;
-        lblFromHdr.Font      = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
-        lblFromHdr.Location  = new System.Drawing.Point(8, y1 + 2);
-        lblFromHdr.Text      = "From";
+        lblFromHdr.Font      = UiTheme.FontLabel;
+        lblFromHdr.ForeColor = UiTheme.TextSecondary;
+        lblFromHdr.Location  = new System.Drawing.Point(10, y1 + 2);
+        lblFromHdr.Text      = "FROM";
 
-        // "From Only" checkbox
         chkFromOnly.AutoSize  = true;
-        chkFromOnly.Font      = new System.Drawing.Font("Segoe UI", 8F);
-        chkFromOnly.Location  = new System.Drawing.Point(52, y1);
+        chkFromOnly.Font      = UiTheme.FontSmall;
+        chkFromOnly.ForeColor = UiTheme.TextSecondary;
+        chkFromOnly.Location  = new System.Drawing.Point(58, y1);
         chkFromOnly.Text      = "Only";
 
-        // "To" label  — aligned with new txtTo x=229
         lblToHdr.AutoSize  = true;
-        lblToHdr.Font      = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
-        lblToHdr.Location  = new System.Drawing.Point(229, y1 + 2);
-        lblToHdr.Text      = "To";
+        lblToHdr.Font      = UiTheme.FontLabel;
+        lblToHdr.ForeColor = UiTheme.TextSecondary;
+        lblToHdr.Location  = new System.Drawing.Point(231, y1 + 2);
+        lblToHdr.Text      = "TO";
 
-        // "To Only" checkbox
         chkToOnly.AutoSize  = true;
-        chkToOnly.Font      = new System.Drawing.Font("Segoe UI", 8F);
-        chkToOnly.Location  = new System.Drawing.Point(253, y1);
+        chkToOnly.Font      = UiTheme.FontSmall;
+        chkToOnly.ForeColor = UiTheme.TextSecondary;
+        chkToOnly.Location  = new System.Drawing.Point(257, y1);
         chkToOnly.Text      = "Only";
 
-        // "Sort on Date" checkbox
         chkSortDate.AutoSize  = true;
         chkSortDate.Checked   = true;
-        chkSortDate.Font      = new System.Drawing.Font("Segoe UI", 8F);
-        chkSortDate.Location  = new System.Drawing.Point(360, y1);
+        chkSortDate.Font      = UiTheme.FontSmall;
+        chkSortDate.ForeColor = UiTheme.TextSecondary;
+        chkSortDate.Location  = new System.Drawing.Point(364, y1);
         chkSortDate.Text      = "Sort on Date";
 
-        // "First/Last Stn Seats" checkbox
         chkFirstLast.AutoSize  = true;
-        chkFirstLast.Font      = new System.Drawing.Font("Segoe UI", 8F);
-        chkFirstLast.Location  = new System.Drawing.Point(470, y1);
+        chkFirstLast.Font      = UiTheme.FontSmall;
+        chkFirstLast.ForeColor = UiTheme.TextSecondary;
+        chkFirstLast.Location  = new System.Drawing.Point(474, y1);
         chkFirstLast.Text      = "First / Last Stn Seats";
 
-        // Train Type combobox
         cmbTrainType.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-        cmbTrainType.Font     = new System.Drawing.Font("Segoe UI", 8F);
-        cmbTrainType.Location = new System.Drawing.Point(625, y1 - 1);
-        cmbTrainType.Size     = new System.Drawing.Size(120, 22);
+        cmbTrainType.Location = new System.Drawing.Point(627, y1 - 1);
+        cmbTrainType.Size     = new System.Drawing.Size(120, 24);
+        UiTheme.StyleCombo(cmbTrainType);
         cmbTrainType.Items.AddRange(new object[]
         {
             "All Train Types", "Super Fast", "Rajdhani", "Sampark Kranti",
@@ -107,75 +115,71 @@ partial class Form1
         });
         cmbTrainType.SelectedIndex = 0;
 
-        // "Get Trains" button  — shifted right to x=756
-        btnGetTrains.Font     = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
-        btnGetTrains.Location = new System.Drawing.Point(756, y1 - 2);
-        btnGetTrains.Size     = new System.Drawing.Size(100, 52);
+        // "Get Trains" — the one primary action on this screen, styled to
+        // stand out (solid accent fill) rather than blend in with the rest.
+        // Spans both rows vertically, so its X has to clear the WIDEST of
+        // row 1's cmbTrainType (ends 747) and row 2's cmbClass (ends 808) —
+        // not just whichever row it looks aligned with at a glance.
+        btnGetTrains.Location = new System.Drawing.Point(822, y1 - 4);
+        btnGetTrains.Size     = new System.Drawing.Size(100, 66);
         btnGetTrains.Text     = "Get Trains";
-        btnGetTrains.UseVisualStyleBackColor = true;
+        UiTheme.StylePrimary(btnGetTrains);
         btnGetTrains.Click   += new System.EventHandler(btnGetTrains_Click);
 
-        // "Save Train" button
-        btnSaveTrain.Font     = new System.Drawing.Font("Segoe UI", 8F);
-        btnSaveTrain.Location = new System.Drawing.Point(864, y1 - 2);
-        btnSaveTrain.Size     = new System.Drawing.Size(90, 24);
+        // "Save Train" / "Booking Manager" — secondary actions, quiet outline.
+        // x=930 clears btnGetTrains's true right edge (822+100=922) plus a gap.
+        btnSaveTrain.Location = new System.Drawing.Point(930, y1 - 4);
+        btnSaveTrain.Size     = new System.Drawing.Size(96, 30);
         btnSaveTrain.Text     = "Save Train";
-        btnSaveTrain.UseVisualStyleBackColor = true;
+        UiTheme.StyleSecondary(btnSaveTrain);
         btnSaveTrain.Click   += new System.EventHandler(btnSaveTrain_Click);
 
-        // "Booking Manager" button
-        btnBookingMgr.Font     = new System.Drawing.Font("Segoe UI", 8F);
-        btnBookingMgr.Location = new System.Drawing.Point(864, y1 + 26);
-        btnBookingMgr.Size     = new System.Drawing.Size(90, 24);
+        btnBookingMgr.Location = new System.Drawing.Point(930, y1 + 30);
+        btnBookingMgr.Size     = new System.Drawing.Size(96, 30);
         btnBookingMgr.Text     = "Booking Mgr";
-        btnBookingMgr.UseVisualStyleBackColor = true;
+        UiTheme.StyleSecondary(btnBookingMgr);
         btnBookingMgr.Click   += new System.EventHandler(btnBookingMgr_Click);
 
-        // ── ROW 2 ────────────────────────────────────────────────────────────
-        int y2 = 38;
+        // ── ROW 2 — the actual search fields ───────────────────────────────────
+        int y2 = 44;
 
-        // From TextBox  (wider — shows "Station Name (CODE)")
-        txtFrom.Font            = new System.Drawing.Font("Segoe UI", 9.5F);
-        txtFrom.Location        = new System.Drawing.Point(8, y2);
-        txtFrom.Size            = new System.Drawing.Size(185, 24);
+        txtFrom.Location        = new System.Drawing.Point(10, y2);
+        txtFrom.Size            = new System.Drawing.Size(187, 26);
         txtFrom.PlaceholderText = "From station or code...";
-        txtFrom.KeyDown        += (s, e) =>
+        UiTheme.StyleTextBox(txtFrom);
+        txtFrom.KeyDown += (s, e) =>
         {
             if (e.KeyCode == System.Windows.Forms.Keys.Enter) txtTo.Focus();
         };
 
-        // Swap button
-        btnSwap.Font     = new System.Drawing.Font("Segoe UI", 10F);
-        btnSwap.Location = new System.Drawing.Point(197, y2);
-        btnSwap.Size     = new System.Drawing.Size(28, 24);
-        btnSwap.Text     = "⇆";
-        btnSwap.UseVisualStyleBackColor = true;
-        btnSwap.Click   += new System.EventHandler(btnSwap_Click);
+        btnSwap.Font      = new System.Drawing.Font("Segoe UI", 10F);
+        btnSwap.Location  = new System.Drawing.Point(199, y2);
+        btnSwap.Size      = new System.Drawing.Size(30, 26);
+        btnSwap.Text      = "⇆";
+        UiTheme.StyleSecondary(btnSwap);
+        btnSwap.Click    += new System.EventHandler(btnSwap_Click);
 
-        // To TextBox
-        txtTo.Font            = new System.Drawing.Font("Segoe UI", 9.5F);
-        txtTo.Location        = new System.Drawing.Point(229, y2);
-        txtTo.Size            = new System.Drawing.Size(185, 24);
+        txtTo.Location        = new System.Drawing.Point(231, y2);
+        txtTo.Size            = new System.Drawing.Size(187, 26);
         txtTo.PlaceholderText = "To station or code...";
-        txtTo.KeyDown        += (s, e) =>
+        UiTheme.StyleTextBox(txtTo);
+        txtTo.KeyDown += (s, e) =>
         {
             if (e.KeyCode == System.Windows.Forms.Keys.Enter) btnGetTrains.PerformClick();
         };
 
-        // Date picker
-        dtpDate.Font         = new System.Drawing.Font("Segoe UI", 8.5F);
+        dtpDate.Font         = UiTheme.FontSmall;
         dtpDate.Format       = System.Windows.Forms.DateTimePickerFormat.Custom;
         dtpDate.CustomFormat = "dd-MMM-yy ddd";
-        dtpDate.Location     = new System.Drawing.Point(420, y2);
-        dtpDate.Size         = new System.Drawing.Size(145, 24);
+        dtpDate.Location     = new System.Drawing.Point(424, y2);
+        dtpDate.Size         = new System.Drawing.Size(145, 26);
         dtpDate.Value        = DateTime.Today;
         dtpDate.MinDate      = DateTime.Today;
 
-        // Quota combobox
         cmbQuota.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-        cmbQuota.Font     = new System.Drawing.Font("Segoe UI", 8F);
-        cmbQuota.Location = new System.Drawing.Point(570, y2);
-        cmbQuota.Size     = new System.Drawing.Size(130, 22);
+        cmbQuota.Location = new System.Drawing.Point(576, y2);
+        cmbQuota.Size     = new System.Drawing.Size(130, 26);
+        UiTheme.StyleCombo(cmbQuota);
         cmbQuota.Items.AddRange(new object[]
         {
             "Multi Quota", "General Quota", "Tatkal", "Pre.Tatkal",
@@ -184,11 +188,10 @@ partial class Form1
         });
         cmbQuota.SelectedIndex = 1;
 
-        // Class filter combobox
         cmbClass.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-        cmbClass.Font     = new System.Drawing.Font("Segoe UI", 8F);
-        cmbClass.Location = new System.Drawing.Point(704, y2);
-        cmbClass.Size     = new System.Drawing.Size(96, 22);
+        cmbClass.Location = new System.Drawing.Point(712, y2);
+        cmbClass.Size     = new System.Drawing.Size(96, 26);
+        UiTheme.StyleCombo(cmbClass);
         cmbClass.Items.AddRange(new object[]
         {
             "All Classes", "1A - First AC", "2A - 2Tier AC", "3A - 3Tier AC",
@@ -199,42 +202,56 @@ partial class Form1
         cmbClass.SelectedIndex = 0;
 
         // ── pnlStatus ────────────────────────────────────────────────────────
-        pnlStatus.BackColor = System.Drawing.Color.FromArgb(225, 225, 225);
+        pnlStatus.BackColor = UiTheme.Primary;
         pnlStatus.Controls.Add(lblStatus);
         pnlStatus.Dock   = System.Windows.Forms.DockStyle.Bottom;
-        pnlStatus.Height = 24;
+        pnlStatus.Height = 26;
 
         lblStatus.Dock      = System.Windows.Forms.DockStyle.Fill;
-        lblStatus.Font      = new System.Drawing.Font("Segoe UI", 8.5F);
-        lblStatus.Padding   = new System.Windows.Forms.Padding(6, 0, 0, 0);
+        lblStatus.Font      = UiTheme.FontSmall;
+        lblStatus.ForeColor = UiTheme.TextOnPrimary;
+        lblStatus.Padding   = new System.Windows.Forms.Padding(10, 0, 0, 0);
         lblStatus.Text      = "Enter station codes (e.g. NDLS → BCT) and click Get Trains.";
         lblStatus.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
 
         // ── dgvTrains ─────────────────────────────────────────────────────────
         dgvTrains.AllowUserToAddRows    = false;
         dgvTrains.AllowUserToDeleteRows = false;
-        dgvTrains.BackgroundColor       = System.Drawing.Color.White;
+        dgvTrains.BackgroundColor       = UiTheme.Background;
         dgvTrains.BorderStyle           = System.Windows.Forms.BorderStyle.None;
+        dgvTrains.CellBorderStyle       = System.Windows.Forms.DataGridViewCellBorderStyle.SingleHorizontal;
         dgvTrains.ColumnHeadersHeightSizeMode =
             System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode.AutoSize;
+        dgvTrains.ColumnHeadersBorderStyle = System.Windows.Forms.DataGridViewHeaderBorderStyle.None;
+        dgvTrains.EnableHeadersVisualStyles = false;
         dgvTrains.Dock            = System.Windows.Forms.DockStyle.Fill;
         dgvTrains.ReadOnly        = true;
         dgvTrains.RowHeadersVisible = false;
         dgvTrains.SelectionMode   = System.Windows.Forms.DataGridViewSelectionMode.FullRowSelect;
-        dgvTrains.Font            = new System.Drawing.Font("Segoe UI", 8.5F);
-        dgvTrains.GridColor       = System.Drawing.Color.FromArgb(210, 210, 210);
+        dgvTrains.Font            = UiTheme.FontBody;
+        dgvTrains.RowTemplate.Height = 30;
+        dgvTrains.GridColor       = UiTheme.Border;
         dgvTrains.ColumnHeadersDefaultCellStyle.Font =
             new System.Drawing.Font("Segoe UI", 8.5F, System.Drawing.FontStyle.Bold);
+        dgvTrains.ColumnHeadersDefaultCellStyle.BackColor    = UiTheme.Primary;
+        dgvTrains.ColumnHeadersDefaultCellStyle.ForeColor    = UiTheme.TextOnPrimary;
+        dgvTrains.ColumnHeadersDefaultCellStyle.SelectionBackColor = UiTheme.Primary;
+        dgvTrains.ColumnHeadersDefaultCellStyle.SelectionForeColor = UiTheme.TextOnPrimary;
+        dgvTrains.ColumnHeadersHeight = 32;
         dgvTrains.ColumnHeadersDefaultCellStyle.Alignment =
             System.Windows.Forms.DataGridViewContentAlignment.MiddleCenter;
-        dgvTrains.AlternatingRowsDefaultCellStyle.BackColor =
-            System.Drawing.Color.FromArgb(245, 248, 255);
+        dgvTrains.DefaultCellStyle.BackColor          = UiTheme.Surface;
+        dgvTrains.DefaultCellStyle.ForeColor          = UiTheme.TextPrimary;
+        dgvTrains.DefaultCellStyle.SelectionBackColor = UiTheme.PrimaryLight;
+        dgvTrains.DefaultCellStyle.SelectionForeColor = UiTheme.TextOnPrimary;
+        dgvTrains.AlternatingRowsDefaultCellStyle.BackColor = UiTheme.CardAlt;
         dgvTrains.DefaultCellStyle.Padding =
-            new System.Windows.Forms.Padding(2, 0, 2, 0);
+            new System.Windows.Forms.Padding(4, 0, 4, 0);
 
         // ── Form1 ─────────────────────────────────────────────────────────────
         AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
         AutoScaleMode       = System.Windows.Forms.AutoScaleMode.Font;
+        BackColor           = UiTheme.Background;
         ClientSize          = new System.Drawing.Size(1200, 680);
         Controls.Add(dgvTrains);
         Controls.Add(pnlStatus);
@@ -253,6 +270,7 @@ partial class Form1
 
     // ── field declarations ────────────────────────────────────────────────────
     private System.Windows.Forms.Panel            pnlSearch;
+    private System.Windows.Forms.Panel            pnlSearchBar;
     private System.Windows.Forms.Label            lblFromHdr;
     private System.Windows.Forms.CheckBox         chkFromOnly;
     private System.Windows.Forms.Label            lblToHdr;

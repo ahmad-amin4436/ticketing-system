@@ -71,6 +71,20 @@ public class ProxyConfig
         if (string.IsNullOrEmpty(text) || text == "user:pass@host:port")
             return new ProxyConfig { Enabled = false };
 
+        // A pasted proxy URL commonly includes a scheme ("http://demo:demo@host:port")
+        // — strip it before parsing. Without this, "http://" was silently swallowed
+        // into the credentials portion of the user:pass@host:port format (its first
+        // ':' looked exactly like the username/password separator), producing
+        // Username="http", Password="//demo:demo" with no error shown at all.
+        foreach (var scheme in new[] { "http://", "https://" })
+        {
+            if (text.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
+            {
+                text = text[scheme.Length..];
+                break;
+            }
+        }
+
         string host, username = "", password = "";
         int port;
 

@@ -3,15 +3,6 @@ using System.IO;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
-using indian_ticketing.AI.Actions;
-using indian_ticketing.AI.Agent;
-using indian_ticketing.AI.Configuration;
-using indian_ticketing.AI.Goals;
-using indian_ticketing.AI.Logging;
-using indian_ticketing.AI.Observation;
-using indian_ticketing.AI.Planning;
-using indian_ticketing.AI.Verification;
-using indian_ticketing.AI.WebsiteAdapters;
 
 namespace indian_ticketing;
 
@@ -21,16 +12,16 @@ public class BookingManagerForm : Form
     private readonly SplitContainer _split       = new();
     private readonly Panel          _topBar      = new();
     private readonly Label          _lblTitle    = new();
-    private readonly Label          _lblUser     = new();
     private readonly TextBox        _txtUser     = new();
-    private readonly Label          _lblPass     = new();
     private readonly TextBox        _txtPass     = new();
-    private readonly Label          _lblProxy    = new();
     private readonly TextBox        _txtProxy    = new();
     private readonly Button         _btnStartAll = new();
     private readonly Button         _btnRefresh  = new();
     private readonly Button         _btnSaveProxy = new();
     private readonly Button         _btnToggleProxy = new();
+    private readonly Label          _lblSession  = new();
+    private readonly ToolTip        _sessionTip  = new();
+    private readonly Button         _btnManageUsers = new();
     private readonly FlowLayoutPanel _cardPanel  = new();
     private WebView2                _webView     = new();
 
@@ -62,7 +53,49 @@ public class BookingManagerForm : Form
         }
         Shown += (_, _) => _split.SplitterDistance = 320;  // layout complete here
         Load  += async (_, _) => await InitializeWebViewAsync();
+        ApplyRolePermissions();
         RebuildCards();
+    }
+
+    // Users without MANAGE_CREDENTIALS can view the booking list but not
+    // touch IRCTC credentials/proxy settings or start/delete bookings
+    // (needs MANAGE_BOOKINGS) or manage users (needs MANAGE_USERS) — which
+    // permissions those actually are is entirely data-driven from the
+    // Users/Roles/Permissions tables via Session.Has(...), not a hardcoded
+    // role check, so a custom role can be granted any subset of these.
+    private void ApplyRolePermissions()
+    {
+        var user = Session.CurrentUser;
+        // Single-letter role badge (A/O/…) instead of spelling the role
+        // name out — keeps the header bar compact regardless of how long a
+        // custom role's name is. Full name still available on hover so
+        // nothing's actually lost, just not spelled out inline.
+        if (user != null)
+        {
+            _lblSession.Text = $"Signed in as {user.Username} ({user.RoleName[..1].ToUpperInvariant()})";
+            _sessionTip.SetToolTip(_lblSession, $"Role: {user.RoleName}");
+        }
+        else
+        {
+            _lblSession.Text = "Not signed in";
+        }
+
+        _btnManageUsers.Visible = Session.Has("MANAGE_USERS");
+
+        if (!Session.Has("MANAGE_CREDENTIALS"))
+        {
+            // Mask the displayed credentials rather than just disabling the
+            // boxes — a restricted user shouldn't be able to read the IRCTC
+            // account password or the proxy's plain-text host/port/creds.
+            _txtUser.Text = "••••••••"; _txtUser.Enabled = false;
+            _txtPass.Text = "••••••••"; _txtPass.Enabled = false;
+            _txtProxy.Text = "•••• (restricted)"; _txtProxy.Enabled = false;
+            _btnSaveProxy.Enabled   = false;
+            _btnToggleProxy.Enabled = false;
+        }
+
+        if (!Session.Has("MANAGE_BOOKINGS"))
+            _btnStartAll.Enabled = false;
     }
 
     private static string GetWebView2UserDataFolder()
@@ -269,93 +302,125 @@ public class BookingManagerForm : Form
     // ── UI construction ───────────────────────────────────────────────────
     private void BuildUi()
     {
-        // Top bar
+        // Top bar — two rows, each laid out with FlowLayoutPanels instead of
+        // hand-computed X coordinates. Absolute positioning here repeatedly
+        // produced overlaps (a label's actual rendered width never quite
+        // matched what was guessed for the next control's X) — a flow panel
+        // measures each child's real size and places the next one after it,
+        // so this class of bug can't recur regardless of font metrics.
         _topBar.Dock      = DockStyle.Top;
-        _topBar.Height    = 52;
-        _topBar.BackColor = Color.FromArgb(30, 144, 255);
-        _topBar.Padding   = new Padding(6, 6, 6, 0);
+        _topBar.Height    = 92;
+        _topBar.BackColor = UiTheme.Primary;
+
+        // Row 1: title on the left, action buttons on the right.
+        var row1 = new Panel { Dock = DockStyle.Top, Height = 44 };
 
         _lblTitle.AutoSize  = true;
-        _lblTitle.Font      = new Font("Segoe UI", 12F, FontStyle.Bold);
-        _lblTitle.ForeColor = Color.White;
-        _lblTitle.Location  = new Point(8, 12);
-        _lblTitle.Text      = "IRCTC Booking Manager";
+        _lblTitle.Font      = UiTheme.FontTitle;
+        _lblTitle.ForeColor = UiTheme.TextOnPrimary;
+        _lblTitle.Margin    = new Padding(10, 12, 0, 0);
+        _lblTitle.Dock      = DockStyle.Left;
 
-        void Lbl(Label l, string t, int x)
+        var actionsFlow = new FlowLayoutPanel
         {
-            l.AutoSize = true; l.Font = new Font("Segoe UI", 8.5F, FontStyle.Bold);
-            l.ForeColor = Color.White; l.Location = new Point(x, 16); l.Text = t;
-        }
-        Lbl(_lblUser, "User:", 230);
-        Lbl(_lblPass, "Pass:", 380);
-        Lbl(_lblProxy, "Proxy:", 548);
+            Dock = DockStyle.Right, AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+            Padding = new Padding(0, 8, 10, 0),
+        };
 
-        void Txt(TextBox t, int x, bool pwd = false)
+        _lblSession.AutoSize  = true;
+        _lblSession.Font      = UiTheme.FontSmall;
+        _lblSession.ForeColor = Color.FromArgb(0xC8, 0xD6, 0xE8);
+        _lblSession.Margin    = new Padding(0, 15, 14, 0);
+
+        _btnManageUsers.Size   = new Size(104, 28);
+        _btnManageUsers.Text   = "Manage Users";
+        _btnManageUsers.Margin = new Padding(0, 0, 8, 0);
+        UiTheme.StyleOnHeader(_btnManageUsers);
+        _btnManageUsers.Click += (_, _) => new UserManagementForm().ShowDialog(this);
+
+        _btnStartAll.Size = new Size(130, 28);
+        _btnStartAll.Text = "Start All Bookings";
+        _btnStartAll.Margin = new Padding(0, 0, 8, 0);
+        UiTheme.StylePrimary(_btnStartAll);
+        _btnStartAll.Click += (_, _) => StartAllBookings();
+
+        _btnRefresh.Size = new Size(70, 28);
+        _btnRefresh.Text = "Refresh";
+        _btnRefresh.Margin = new Padding(0);
+        UiTheme.StyleOnHeader(_btnRefresh);
+        _btnRefresh.Click += (_, _) => { _bookings = SavedBooking.LoadAll(); RebuildCards(); };
+
+        actionsFlow.Controls.Add(_lblSession);
+        actionsFlow.Controls.Add(_btnManageUsers);
+        actionsFlow.Controls.Add(_btnStartAll);
+        actionsFlow.Controls.Add(_btnRefresh);
+        row1.Controls.Add(actionsFlow);
+        row1.Controls.Add(_lblTitle);
+
+        // Row 2: credentials + proxy, all in one flowing sequence.
+        var row2 = new FlowLayoutPanel
         {
-            t.Font = new Font("Segoe UI", 9F); t.Location = new Point(x, 12);
-            t.Size = new Size(120, 24); if (pwd) t.PasswordChar = '*';
+            Dock = DockStyle.Top, Height = 44,
+            FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+            Padding = new Padding(10, 6, 0, 0),
+        };
+
+        Label Lbl(string t) => new()
+        {
+            AutoSize = true, Font = UiTheme.FontLabel,
+            ForeColor = Color.FromArgb(0xC8, 0xD6, 0xE8), Text = t,
+            Margin = new Padding(0, 11, 4, 0),
+        };
+
+        void Txt(TextBox t, int width, bool pwd = false)
+        {
+            t.Font = UiTheme.FontBody; t.BorderStyle = BorderStyle.FixedSingle;
+            t.Size = new Size(width, 26); t.Margin = new Padding(0, 4, 16, 0);
+            if (pwd) t.PasswordChar = '*';
         }
-        Txt(_txtUser, 270); Txt(_txtPass, 418, true);
-        _txtProxy.Font = new Font("Segoe UI", 8F);
-        _txtProxy.Location = new Point(590, 12);
-        _txtProxy.Size = new Size(230, 24);
+        Txt(_txtUser, 120); Txt(_txtPass, 120, true); Txt(_txtProxy, 200);
+        _txtProxy.Font = UiTheme.FontSmall;
         _txtProxy.Text = "user:pass@host:port";
 
-        _btnSaveProxy.Font = new Font("Segoe UI", 8F);
-        _btnSaveProxy.Location = new Point(826, 10);
-        _btnSaveProxy.Size = new Size(50, 28);
-        _btnSaveProxy.Text = "Set";
-        _btnSaveProxy.BackColor = Color.FromArgb(80, 80, 80);
-        _btnSaveProxy.ForeColor = Color.White;
-        _btnSaveProxy.FlatStyle = FlatStyle.Flat;
+        _btnSaveProxy.Size   = new Size(50, 28);
+        _btnSaveProxy.Text   = "Set";
+        _btnSaveProxy.Margin = new Padding(0, 3, 8, 0);
+        UiTheme.StyleOnHeader(_btnSaveProxy);
         _btnSaveProxy.Click += async (_, _) => await SaveProxyFromTextBoxAsync();
 
         // Enable/Disable Proxy — switches the live browser between direct
         // and proxy right here (no closing/reopening this window needed).
         // Label reflects current state; UpdateProxyToggleButton keeps it in
         // sync after every change (Set, toggle, or load).
-        _btnToggleProxy.Font      = new Font("Segoe UI", 8F, FontStyle.Bold);
-        _btnToggleProxy.Location  = new Point(882, 10);
-        _btnToggleProxy.Size      = new Size(90, 28);
-        _btnToggleProxy.FlatStyle = FlatStyle.Flat;
-        _btnToggleProxy.ForeColor = Color.White;
-        _btnToggleProxy.Click    += async (_, _) => await ToggleProxyAsync();
+        _btnToggleProxy.Size   = new Size(90, 28);
+        _btnToggleProxy.Margin = new Padding(0, 3, 0, 0);
+        _btnToggleProxy.Click += async (_, _) => await ToggleProxyAsync();
         UpdateProxyToggleButton();
 
-        _btnStartAll.Font      = new Font("Segoe UI", 9F, FontStyle.Bold);
-        _btnStartAll.Location  = new Point(978, 10);
-        _btnStartAll.Size      = new Size(130, 28);
-        _btnStartAll.Text      = "Start All Bookings";
-        _btnStartAll.BackColor = Color.FromArgb(0, 110, 200);
-        _btnStartAll.ForeColor = Color.White;
-        _btnStartAll.FlatStyle = FlatStyle.Flat;
-        _btnStartAll.Click    += (_, _) => StartAllBookings();
-
-        _btnRefresh.Font      = new Font("Segoe UI", 9F);
-        _btnRefresh.Location  = new Point(1114, 10);
-        _btnRefresh.Size      = new Size(70, 28);
-        _btnRefresh.Text      = "Refresh";
-        _btnRefresh.UseVisualStyleBackColor = true;
-        _btnRefresh.Click += (_, _) => { _bookings = SavedBooking.LoadAll(); RebuildCards(); };
-
-        _topBar.Controls.AddRange(new Control[] {
-            _lblTitle, _lblUser, _txtUser, _lblPass, _txtPass,
-            _lblProxy, _txtProxy, _btnSaveProxy, _btnToggleProxy, _btnStartAll, _btnRefresh
+        row2.Controls.AddRange(new Control[]
+        {
+            Lbl("USER"), _txtUser, Lbl("PASS"), _txtPass,
+            Lbl("PROXY"), _txtProxy, _btnSaveProxy, _btnToggleProxy,
         });
+
+        _topBar.Controls.Add(row2);
+        _topBar.Controls.Add(row1);
 
         // Split container — SplitterDistance set in Shown (layout is complete by then)
         _split.Dock          = DockStyle.Fill;
         _split.Panel1MinSize = 280;
         _split.Panel2MinSize = 100;
         _split.BorderStyle   = BorderStyle.None;
+        _split.BackColor     = UiTheme.Border; // shows through as a thin splitter line
 
         // Left: scrollable card panel
         _cardPanel.Dock          = DockStyle.Fill;
         _cardPanel.FlowDirection = FlowDirection.TopDown;
         _cardPanel.AutoScroll    = true;
         _cardPanel.WrapContents  = false;
-        _cardPanel.BackColor     = Color.FromArgb(240, 243, 250);
-        _cardPanel.Padding       = new Padding(4, 4, 4, 4);
+        _cardPanel.BackColor     = UiTheme.Background;
+        _cardPanel.Padding       = new Padding(8, 8, 8, 8);
         _split.Panel1.Controls.Add(_cardPanel);
 
         // Right: WebView2 (embedded IRCTC browser)
@@ -365,6 +430,7 @@ public class BookingManagerForm : Form
         // Form
         Controls.Add(_split);
         Controls.Add(_topBar);
+        BackColor    = UiTheme.Background;
         ClientSize   = new Size(1200, 680);
         MinimumSize  = new Size(920, 480);
         Text         = "IRCTC Booking Manager";
@@ -383,9 +449,11 @@ public class BookingManagerForm : Form
             var card = new BookingCard(b);
             card.Width = _split.Panel1.ClientSize.Width - 12;
             card.OnBookClicked   += () => StartBooking(b, card);
-            card.OnAiBookClicked += () => StartAiBooking(b, card);
             card.OnAckClicked    += () => _session?.AcknowledgeUserAction();
             card.OnDeleteClicked += () => { _bookings.Remove(b); SavedBooking.SaveAll(_bookings); RebuildCards(); };
+            // Users without MANAGE_BOOKINGS can view cards but not start or
+            // delete bookings.
+            card.SetActionsEnabled(Session.Has("MANAGE_BOOKINGS"));
             _cardPanel.Controls.Add(card);
             _cards.Add(card);
         }
@@ -498,8 +566,8 @@ public class BookingManagerForm : Form
     private void UpdateProxyToggleButton()
     {
         bool on = _proxy.IsConfigured;
-        _btnToggleProxy.Text      = on ? "Proxy: ON" : "Proxy: OFF";
-        _btnToggleProxy.BackColor = on ? Color.FromArgb(0, 150, 90) : Color.FromArgb(120, 120, 120);
+        _btnToggleProxy.Text = on ? "Proxy: ON" : "Proxy: OFF";
+        UiTheme.StyleToggle(_btnToggleProxy, on);
     }
 
     // ── Booking logic ─────────────────────────────────────────────────────
@@ -522,74 +590,6 @@ public class BookingManagerForm : Form
 
         await _session.RunAsync(booking, u, p);
         card.SetBooking(false);
-    }
-
-    // ── Adaptive AI Agent booking (opt-in, alongside the deterministic engine above) ───────
-    private async void StartAiBooking(SavedBooking booking, BookingCard card)
-    {
-        var u = _txtUser.Text.Trim();
-        var p = _txtPass.Text.Trim();
-        if (string.IsNullOrEmpty(u) || string.IsNullOrEmpty(p))
-        {
-            MessageBox.Show("Enter IRCTC credentials in the top bar.", "Missing",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        var config = AiAgentConfigFile.Load();
-        if (!config.AiAgent.Enabled)
-        {
-            MessageBox.Show("The AI agent is disabled in ai_agent_config.json.", "AI Agent Disabled",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-
-        card.SetAiBooking(true);
-
-        var logDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "IndianTicketing", "ai_agent_debug");
-        var logFile = Path.Combine(logDir, $"{booking.Id}_{DateTime.Now:yyyyMMdd_HHmmss}.log");
-        var logger = new AgentLogger(config.AiAgent.DebugMode, new[] { u, p }, logFile);
-
-        using var ollama = new OllamaClient(config.Ollama.BaseUrl, config.Ollama.TimeoutSeconds);
-        var router = new AiModelRouter(
-            ollama, config.Ollama.FastModel, config.Ollama.ReasoningModel,
-            config.AiAgent.ConfidenceThreshold, msg => logger.Log(msg));
-
-        var observer = new WebViewPageObserver(_webView, new IWebsiteAdapter[] { new IrctcWebsiteAdapter() });
-        var validator = new ActionValidator();
-        var executor = new ActionExecutor(observer, key => key switch
-        {
-            "SECURE_USERNAME" => u,
-            "SECURE_PASSWORD" => p,
-            _ => null,
-        });
-        var verifier = new ActionVerifier();
-
-        var agent = new AiBrowserAgent(observer, router, validator, executor, verifier, config.AiAgent, logger);
-        agent.OnStatus += msg => this.Invoke(() => card.SetStatus(msg));
-
-        try
-        {
-            var result = await agent.RunAsync(BookingGoal.FromSavedBooking(booking));
-            card.SetStatus(result.Outcome switch
-            {
-                AgentOutcome.Completed => "AI Agent: booking objective completed.",
-                AgentOutcome.HumanInterventionRequired => $"AI Agent: needs help — {result.Reason}",
-                AgentOutcome.Failed => $"AI Agent failed: {result.Reason}",
-                AgentOutcome.StepLimitReached => "AI Agent: step limit reached.",
-                _ => "AI Agent: stopped.",
-            });
-        }
-        catch (Exception ex)
-        {
-            card.SetStatus($"AI Agent error: {ex.Message}");
-        }
-        finally
-        {
-            card.SetAiBooking(false);
-        }
     }
 
     private void StartAllBookings()
@@ -624,43 +624,51 @@ public class BookingManagerForm : Form
 // ── BookingCard ───────────────────────────────────────────────────────────────
 public class BookingCard : Panel
 {
+    private readonly Panel      _statusStrip;
     private readonly Label      _lblTrain;
     private readonly Label      _lblPax;
     private readonly Label      _lblStatus;
     private readonly Button     _btnBook;
-    private readonly Button     _btnAiBook;
     private readonly Button     _btnAck;
     private readonly Button     _btnDel;
     private readonly PictureBox _picQr;
 
     public event Action? OnBookClicked;
-    public event Action? OnAiBookClicked;
     public event Action? OnAckClicked;
     public event Action? OnDeleteClicked;
 
     public BookingCard(SavedBooking b)
     {
-        Height      = 140;
+        Height      = 144;
         Dock        = DockStyle.None;
-        BackColor   = Color.White;
+        BackColor   = UiTheme.Surface;
         BorderStyle = BorderStyle.FixedSingle;
-        Margin      = new Padding(2, 2, 2, 4);
-        Padding     = new Padding(6);
+        Margin      = new Padding(2, 2, 2, 6);
+        Padding     = new Padding(0, 8, 8, 8); // no left padding: the status strip below sits flush against the edge
+
+        // A thin colored strip along the left edge doubles as an at-a-glance
+        // status indicator (grey=ready, blue=running, green=done, red=error)
+        // without needing to read the status text — updated by SetStatus.
+        _statusStrip = new Panel
+        {
+            Dock = DockStyle.Left, Width = 4, BackColor = UiTheme.Disabled,
+        };
 
         _lblTrain = new Label
         {
-            AutoSize  = false, Location = new Point(6, 6),
-            Size      = new Size(196, 42),
-            Font      = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+            AutoSize  = false, Location = new Point(14, 8),
+            Size      = new Size(196, 44),
+            Font      = new Font("Segoe UI", 9F, FontStyle.Bold),
+            ForeColor = UiTheme.TextPrimary,
             Text      = $"[{b.TrainNo}] {b.TrainName}\n{b.FromCode} → {b.ToCode}  {b.JourneyDate}\n{b.TravelClass} / {b.Quota}",
         };
 
         _lblPax = new Label
         {
-            AutoSize  = false, Location = new Point(6, 52),
+            AutoSize  = false, Location = new Point(14, 54),
             Size      = new Size(196, 30),
-            Font      = new Font("Segoe UI", 7.5F),
-            ForeColor = Color.DimGray,
+            Font      = UiTheme.FontSmall,
+            ForeColor = UiTheme.TextSecondary,
             Text      = b.Passengers.Count > 0
                 ? string.Join(", ", b.Passengers.Select(p => $"{p.Name}({p.Age}{p.Gender})"))
                 : "(no passengers)",
@@ -668,73 +676,79 @@ public class BookingCard : Panel
 
         _lblStatus = new Label
         {
-            AutoSize  = false, Location = new Point(6, 86),
+            AutoSize  = false, Location = new Point(14, 88),
             Size      = new Size(196, 40),
-            Font      = new Font("Segoe UI", 7.5F),
-            ForeColor = Color.Navy,
+            Font      = new Font("Segoe UI", 7.5F, FontStyle.Bold),
+            ForeColor = UiTheme.TextSecondary,
             Text      = "Ready",
         };
 
         _btnBook = new Button
         {
-            Location = new Point(206, 6), Size = new Size(88, 26),
+            Location = new Point(214, 8), Size = new Size(92, 27),
             Text     = "Book on IRCTC",
-            Font     = new Font("Segoe UI", 7.5F, FontStyle.Bold),
-            UseVisualStyleBackColor = true,
         };
+        UiTheme.StylePrimary(_btnBook);
+        _btnBook.Font = UiTheme.FontButtonSmall;
         _btnBook.Click += (_, _) => OnBookClicked?.Invoke();
 
         _btnAck = new Button
         {
-            Location = new Point(206, 36), Size = new Size(88, 24),
-            Text     = "OK (Continue)", Font = new Font("Segoe UI", 7.5F),
-            UseVisualStyleBackColor = true, Enabled = false,
+            Location = new Point(214, 42), Size = new Size(92, 25),
+            Text     = "OK (Continue)", Enabled = false,
         };
+        UiTheme.StyleSecondary(_btnAck);
         _btnAck.Click += (_, _) => OnAckClicked?.Invoke();
 
         _btnDel = new Button
         {
-            Location  = new Point(206, 64), Size = new Size(88, 24),
-            Text      = "Delete", Font = new Font("Segoe UI", 7.5F),
-            ForeColor = Color.Firebrick,
-            UseVisualStyleBackColor = true,
+            Location  = new Point(214, 76), Size = new Size(92, 25),
+            Text      = "Delete",
         };
+        UiTheme.StyleDanger(_btnDel);
         _btnDel.Click += (_, _) => OnDeleteClicked?.Invoke();
-
-        _btnAiBook = new Button
-        {
-            Location  = new Point(206, 92), Size = new Size(88, 24),
-            Text      = "Book (AI Agent)", Font = new Font("Segoe UI", 7F, FontStyle.Bold),
-            ForeColor = Color.FromArgb(0, 100, 0),
-            UseVisualStyleBackColor = true,
-        };
-        _btnAiBook.Click += (_, _) => OnAiBookClicked?.Invoke();
 
         _picQr = new PictureBox
         {
-            Location    = new Point(300, 4), Size = new Size(130, 130),
+            Location    = new Point(310, 6), Size = new Size(130, 130),
             SizeMode    = PictureBoxSizeMode.Zoom,
-            BackColor   = Color.FromArgb(240, 240, 240),
+            BackColor   = UiTheme.CardAlt,
             BorderStyle = BorderStyle.FixedSingle,
             Visible     = false,
         };
 
-        Controls.AddRange(new Control[] { _lblTrain, _lblPax, _lblStatus, _btnBook, _btnAiBook, _btnAck, _btnDel, _picQr });
+        Controls.AddRange(new Control[]
+            { _lblTrain, _lblPax, _lblStatus, _btnBook, _btnAck, _btnDel, _picQr, _statusStrip });
     }
 
     public void SetStatus(string msg)
     {
         _lblStatus.Text = msg;
         bool waiting = msg.Contains("OK (Continue)", StringComparison.OrdinalIgnoreCase);
-        _btnAck.Enabled  = waiting;
-        _btnAck.BackColor = waiting ? Color.LightYellow : SystemColors.Control;
+        _btnAck.Enabled = waiting;
+        if (waiting) { _btnAck.BackColor = UiTheme.Warning; _btnAck.ForeColor = UiTheme.TextOnPrimary; }
+        else UiTheme.StyleSecondary(_btnAck);
+
+        // Color-code the status strip / text so a booking's state reads at
+        // a glance without parsing the message.
+        var lower = msg.ToLowerInvariant();
+        Color c =
+            lower.Contains("error") || lower.Contains("denied") || lower.Contains("failed") || lower.Contains("rejected")
+                ? UiTheme.Danger
+            : lower.Contains("qr") || lower.Contains("scan to pay") || lower.Contains("done")
+                ? UiTheme.Accent
+            : lower.Contains("step") || lower.Contains("running") || lower.Contains("checking") || waiting
+                ? UiTheme.PrimaryLight
+            : UiTheme.Disabled;
+        _statusStrip.BackColor = c;
+        _lblStatus.ForeColor   = c == UiTheme.Disabled ? UiTheme.TextSecondary : c;
     }
 
     public void ShowQr(System.Drawing.Bitmap bmp)
     {
         _picQr.Image   = bmp;
         _picQr.Visible = true;
-        Height         = Math.Max(Height, 140);
+        Height         = Math.Max(Height, 144);
     }
 
     public void SetBooking(bool running)
@@ -743,9 +757,12 @@ public class BookingCard : Panel
         _btnBook.Text    = running ? "Running..." : "Book on IRCTC";
     }
 
-    public void SetAiBooking(bool running)
+    // Called once at card creation based on the signed-in user's
+    // MANAGE_BOOKINGS permission — a restricted user can still see the
+    // card's status/QR, just not trigger or remove a booking.
+    public void SetActionsEnabled(bool enabled)
     {
-        _btnAiBook.Enabled = !running;
-        _btnAiBook.Text    = running ? "AI Running..." : "Book (AI Agent)";
+        _btnBook.Enabled = enabled;
+        _btnDel.Enabled  = enabled;
     }
 }

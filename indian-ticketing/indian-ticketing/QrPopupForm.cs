@@ -11,6 +11,8 @@ namespace indian_ticketing;
 /// </summary>
 public sealed class QrPopupForm : Form
 {
+    private readonly Panel      _header;
+    private readonly Label      _headerLabel;
     private readonly PictureBox _pic;
     private readonly Label      _caption;
 
@@ -23,30 +25,42 @@ public sealed class QrPopupForm : Form
         MinimizeBox     = false;
         ShowInTaskbar   = true;
         TopMost         = true;
-        ClientSize      = new Size(360, 420);
-        BackColor       = Color.White;
+        ClientSize      = new Size(360, 456);
+        BackColor       = UiTheme.Surface;
+
+        _header = new Panel { Dock = DockStyle.Top, Height = 44, BackColor = UiTheme.Primary };
+        _headerLabel = new Label
+        {
+            Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(14, 0, 0, 0),
+            Font = UiTheme.FontHeader, ForeColor = UiTheme.TextOnPrimary,
+            AutoEllipsis = true,
+            Text = $"Scan to Pay — {trainLabel}",
+        };
+        _header.Controls.Add(_headerLabel);
 
         _pic = new PictureBox
         {
-            Location    = new Point(30, 20),
+            Location    = new Point(30, 56),
             Size        = new Size(300, 300),
             SizeMode    = PictureBoxSizeMode.Zoom,
             BorderStyle = BorderStyle.FixedSingle,
-            BackColor   = Color.White,
+            BackColor   = UiTheme.Surface,
         };
 
         _caption = new Label
         {
-            Location  = new Point(20, 330),
+            Location  = new Point(20, 366),
             Size      = new Size(320, 70),
             TextAlign = ContentAlignment.MiddleCenter,
             Font      = new Font("Segoe UI", 10F, FontStyle.Bold),
-            ForeColor = Color.FromArgb(0x1B, 0x3A, 0x6B),
+            ForeColor = UiTheme.Primary,
             Text      = "Scan this QR with any UPI app\n(PhonePe / GPay / Paytm) to complete payment.",
         };
 
         Controls.Add(_pic);
         Controls.Add(_caption);
+        Controls.Add(_header);
     }
 
     /// <summary>Set/replace the QR image and bring the window to the foreground.</summary>

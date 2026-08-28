@@ -471,7 +471,7 @@ true;";
 
             bool settled = await WaitForAsync(
                 $"(function(){{ var c={FirstStationCodeJs}; return !!c && c!=={JsStr(baseline)}; }})()",
-                3000, pollMs: 150);
+                3000, pollMs: 100);
             if (!settled) return new();
 
             // Same divider/"recent journey" filtering already proven correct

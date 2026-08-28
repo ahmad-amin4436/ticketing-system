@@ -153,13 +153,13 @@ public partial class Form1 : Form
     // Looks up suggestions from IRCTC's own live autocomplete (see
     // IrctcWebViewSession.GetStationSuggestionsAsync) instead of a
     // hardcoded local list, so results always match what the real site
-    // would offer. Debounced (300ms of no further typing) so a fast typist
+    // would offer. Debounced (200ms of no further typing) so a fast typist
     // doesn't queue up a script execution per keystroke, and the result is
     // dropped if the field's text has since changed or typing was cancelled.
     private async Task ShowLiveSuggestionsAsync(
         TextBox txt, Panel panel, ListBox list, string query, CancellationToken token)
     {
-        try { await Task.Delay(300, token); }
+        try { await Task.Delay(200, token); }
         catch (TaskCanceledException) { return; }
         if (token.IsCancellationRequested || IsDisposed) return;
 
