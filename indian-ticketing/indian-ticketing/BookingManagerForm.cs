@@ -202,11 +202,20 @@ public class BookingManagerForm : Form
 
             var core = _webView.CoreWebView2;
             if (core == null) throw new InvalidOperationException("WebView2 initialization did not produce a browser core.");
+
+            // Capture edge/anti-bot signals for this initial load so an
+            // Access-Denied landing is diagnosed with its real response headers.
+            // The watcher must outlive the async NavigationCompleted handler,
+            // which fires after this method returns — so it's disposed there.
+            var akamai = new AkamaiDiagInfo();
+            var watcher = AccessDeniedDiagnostics.WatchAkamaiResponses(core, akamai);
+
             core.Navigate("https://www.irctc.co.in/nget/train-search");
 
             // Auto-fill login form if it appears on the initial page
             core.NavigationCompleted += async (_, args) =>
             {
+                watcher.Dispose();
                 if (!args.IsSuccess) return;
                 try
                 {
@@ -218,7 +227,7 @@ public class BookingManagerForm : Form
                     if (blocked)
                     {
                         await AccessDeniedDiagnostics.CaptureAsync(_webView.CoreWebView2,
-                            AutomationFailureKind.AccessDenied, detail: "Initial navigation", useProxy: useProxy, proxy: _proxy);
+                            AutomationFailureKind.AccessDenied, detail: "Initial navigation", useProxy: useProxy, proxy: _proxy, akamai: akamai);
                         MessageBox.Show(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.AccessDenied),
                             "IRCTC Access Denied", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         return;

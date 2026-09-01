@@ -56,6 +56,10 @@ public class IrctcWebViewSession
     // (direct or proxy) before this session object existed, so this class
     // can't observe that choice directly.
     private readonly bool _usingProxy;
+    // Edge/anti-bot signals (X-Akamai-* headers, cookies) captured during the
+    // most recent NavAsync, kept in case a subsequent page-content block check
+    // (Access Denied / challenge) needs them for diagnostics.
+    private AkamaiDiagInfo? _lastAkamai;
 
     public event Action<string>? OnStatus;
     public event Action<System.Drawing.Bitmap>? OnQrReady;
@@ -236,7 +240,7 @@ true;";
             if (blocked)
             {
                 await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2,
-                    AutomationFailureKind.AccessDenied, detail: "Booking workflow initial navigation", useProxy: _usingProxy, proxy: _proxy);
+                    AutomationFailureKind.AccessDenied, detail: "Booking workflow initial navigation", useProxy: _usingProxy, proxy: _proxy, akamai: _lastAkamai);
                 Report(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.AccessDenied));
                 return;
             }
@@ -343,7 +347,7 @@ true;";
         if (blocked)
         {
             await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, AutomationFailureKind.AccessDenied,
-                detail: "Train search", useProxy: useProxy, proxy: _proxy);
+                detail: "Train search", useProxy: useProxy, proxy: _proxy, akamai: _lastAkamai);
             throw new IrctcBlockedException();
         }
 
@@ -2568,11 +2572,19 @@ true;";
         void H(object? s, CoreWebView2NavigationCompletedEventArgs e)
         { _wv.CoreWebView2.NavigationCompleted -= H; tcs.TrySetResult((int)e.HttpStatusCode); }
         _wv.CoreWebView2.NavigationCompleted += H;
+
+        // Collect edge/anti-bot signals (X-Akamai-* headers, status) as the
+        // browser loads, so an Access-Denied or challenge is diagnosed with the
+        // actual response headers rather than page text alone.
+        var akamai = new AkamaiDiagInfo();
+        using var watcher = AccessDeniedDiagnostics.WatchAkamaiResponses(_wv.CoreWebView2, akamai);
+
         _wv.CoreWebView2.Navigate(url);
         try
         {
             var status = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(45));
-            var failure = await AccessDeniedDiagnostics.DetectAndCaptureAsync(_wv.CoreWebView2, status == 0 ? null : status, _usingProxy, _proxy);
+            _lastAkamai = akamai;
+            var failure = await AccessDeniedDiagnostics.DetectAndCaptureAsync(_wv.CoreWebView2, status == 0 ? null : status, _usingProxy, _proxy, akamai);
             if (failure != null) throw new AutomationSiteFailureException(failure.Value);
         }
         catch (TimeoutException)

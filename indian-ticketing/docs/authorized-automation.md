@@ -16,6 +16,17 @@ The browser stops the affected workflow when it detects access denial, HTTP 403/
 
 For each browser failure, a redacted JSON record, screenshot, and rendered HTML are written under `%AppData%\IndianTicketing\automation_diagnostics`. URLs are stored without query strings and proxy credentials are never logged.
 
+When the site's edge protection (e.g. Akamai) rejects a request, the JSON
+record additionally captures the anti-bot signals that explain the block —
+without changing identity or trying to defeat it:
+
+- Akamai response headers (`X-Akamai-*`, `Server`, `Via`) and the HTTP status
+  of the blocked response, captured from `WebResourceResponseReceived`.
+- Akamai/anti-bot cookies present in the `WebView2` cookie jar (`_abck`,
+  `ak_bmsc`, `bm_*`, …), including their domain, expiry and `HttpOnly`/`Secure`
+  flags. Cookie token values are stored only as a short redacted preview, never
+  the full value.
+
 ## Run and validation
 
 ```powershell
