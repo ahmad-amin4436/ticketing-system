@@ -148,6 +148,7 @@ public class BookingManagerForm : Form
 
         var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
         await _webView.EnsureCoreWebView2Async(env);
+        _webView.CoreWebView2.CookieManager.DeleteAllCookies();
 
         // Auto-answer the native proxy-auth dialog ("Sign in to access this
         // site") with the configured credentials, so it never blocks the UI

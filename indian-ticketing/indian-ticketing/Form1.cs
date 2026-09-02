@@ -25,7 +25,12 @@ public partial class Form1 : Form
     // off-canvas position still renders and executes normally; it's just
     // never inside the form's visible client area.
     private WebView2 _webView = new() { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
-    private readonly ProxyConfig _proxy = ProxyConfig.Load();
+    private ProxyConfig _proxy = ProxyConfig.Load();
+    // Which network mode _webView's CoreWebView2 was actually created with —
+    // null until it's been created at all. WebView2's proxy is fixed for the
+    // life of the browser process, so this can only change by tearing down
+    // and recreating _webView (see EnsureSearchWebViewNetworkMode).
+    private bool? _webViewUsesProxy;
 
     // Serializes all use of _webView — both the From/To autocomplete's live
     // station lookups and the actual train search drive the same background
@@ -176,6 +181,7 @@ public partial class Form1 : Form
         try
         {
             if (token.IsCancellationRequested) return;
+            EnsureSearchWebViewNetworkMode();
             var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
             results = await session.GetStationSuggestionsAsync(query);
         }
@@ -381,11 +387,37 @@ public partial class Form1 : Form
         await _webViewGate.WaitAsync();
         try
         {
+            EnsureSearchWebViewNetworkMode();
             var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
             await session.PrewarmSearchPageAsync();
         }
         catch { /* best-effort */ }
         finally { _webViewGate.Release(); }
+    }
+
+    // Re-reads the saved proxy config (BookingManagerForm's Proxy ON/OFF
+    // toggle writes to the same file) and, if that's a different mode than
+    // this WebView2 was actually created with, tears it down and rebuilds
+    // it — WebView2's proxy is fixed for the life of the browser process,
+    // so a mode change can never take effect any other way. Must be called
+    // while holding _webViewGate.
+    private void EnsureSearchWebViewNetworkMode()
+    {
+        _proxy = ProxyConfig.Load();
+        bool wantProxy = _proxy.IsConfigured;
+        if (_webViewUsesProxy == wantProxy) return;
+
+        if (_webView.CoreWebView2 != null)
+        {
+            var old = _webView;
+            Controls.Remove(old);
+            old.Dispose();
+
+            _webView = new WebView2 { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
+            Controls.Add(_webView);
+            _webView.BringToFront();
+        }
+        _webViewUsesProxy = wantProxy;
     }
 
     // The configured proxy (if any) is used as normal infrastructure. A site
@@ -397,6 +429,7 @@ public partial class Form1 : Form
         await _webViewGate.WaitAsync();
         try
         {
+            EnsureSearchWebViewNetworkMode();
             var session = new IrctcWebViewSession(_webView, _proxy, "WebView2-Search");
             return await session.SearchTrainsAsync(fromCode, toCode, date, progress, useProxy: _proxy.IsConfigured);
         }

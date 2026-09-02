@@ -186,6 +186,7 @@ true;";
         // throws "CreationProperties cannot be modified after the
         // initialization of CoreWebView2 has begun."
         await _wv.EnsureCoreWebView2Async(env);
+        _wv.CoreWebView2.CookieManager.DeleteAllCookies();
 
         // Auto-answer the native proxy-auth dialog ("Sign in to access this
         // site") with the configured proxy credentials, so it never blocks
@@ -430,7 +431,12 @@ true;";
     {
         try
         {
-            await EnsureCoreWebView2Async(false);
+            // Honor whatever network mode the caller configured this session
+            // with (Form1 passes a fresh IrctcWebViewSession per call, built
+            // from the currently saved ProxyConfig) rather than hardcoding
+            // direct — a prewarm that locks the WebView2 into the wrong mode
+            // can't be corrected later without tearing it down.
+            await EnsureCoreWebView2Async(_proxy?.IsConfigured ?? false);
             if (await EnsureOnSearchPageAsync())
             {
                 // Popups (language alert / login) only ever appear right
@@ -468,7 +474,7 @@ true;";
 
         try
         {
-            await EnsureCoreWebView2Async(false);
+            await EnsureCoreWebView2Async(_proxy?.IsConfigured ?? false);
             if (await EnsureOnSearchPageAsync())
             {
                 await DismissLanguageAlertAsync();
