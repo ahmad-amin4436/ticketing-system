@@ -14,10 +14,10 @@ static class Program
     {
         ApplicationConfiguration.Initialize();
 
-        if (!CheckTrial())
-        {
-            return;
-        }
+        //if (!CheckTrial())
+        //{
+        //    return;
+        //}
 
         try
         {
