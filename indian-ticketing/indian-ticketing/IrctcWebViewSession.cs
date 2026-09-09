@@ -942,45 +942,43 @@ true;";
             await UserAckAsync(); await InjectAsync();
         }
 
-        // Step 3b — wait for availability data to load (WL/AVAIL/DEPARTED appears)
-        Report("Step 3 — Waiting for availability dates to load...");
-        bool avlReady = await WaitForAsync(@"(function(){
-  return Array.from(document.querySelectorAll('div,span,td'))
-    .some(function(e){
-      var t=(e.innerText||'').toUpperCase().trim();
-      return (t.startsWith('AVAIL')||t.startsWith('WL')||t==='TRAIN DEPARTED'||t.includes('NOT AVAIL'))
-          && e.offsetHeight<60;
-    });
-})()", 10000);
-
-        if (!avlReady)
-        {
-            Report("Dates didn't load — click the class box manually, then 'OK (Continue)'.");
-            await UserAckAsync();
-        }
-        await D(400); await InjectAsync();
-
-        // Step 3c — click the saved journey date. Confirmed live markup: each
-        // date option is ALSO a ".pre-avl" widget (the same component the
-        // class tabs used before the panel expanded), with the date text in
-        // its own <strong> and the WL/AVAILABLE/NOT AVAILABLE status in a
-        // separate sibling <strong> — so match on the date's <strong>
-        // specifically instead of a combined-text/height heuristic. The
+        // Step 3b/3c — wait for THIS TRAIN's own date carousel to actually
+        // contain the target date, then click it. Confirmed live (via CDP):
+        // each train's card gets a real <div avllazyload> placeholder before
+        // its class-expanded date carousel finishes loading, and results
+        // pages can have several other trains whose availability text is
+        // already sitting on the page — so the OLD page-wide "does ANY
+        // element anywhere say AVAIL/WL/DEPARTED" check could resolve from
+        // a completely different train while this one was still loading,
+        // letting the single click attempt below fire too early and never
+        // retry once it failed. Scoping the wait itself to this train's own
+        // card (same ancestor-walk pattern as ClassBoxJs/BookNowBtnJs) and
+        // polling for the actual target date — not just "some availability
+        // text exists" — fixes the race instead of just failing faster.
+        // Confirmed live markup: each date option is a ".pre-avl" widget
+        // (the same component the class tabs used before the panel
+        // expanded), with the date text in its own <strong> ("Thu, 10 Sep")
+        // and the WL/AVAILABLE/NOT AVAILABLE status in a separate sibling
+        // <strong> — so match on the date's <strong> specifically. The
         // class tabs are now a <p-tabmenu>/<li> structure at this point (not
         // ".pre-avl"), so this selector can't collide with them.
         var dp    = b.JourneyDate.Split('-');
         var day   = dp.Length > 0 ? dp[0].TrimStart('0') : "";
-        var month = dp.Length > 1 ? dp[1].ToUpper() : "";
-        Report($"Step 3 — Selecting date {day} {month}...");
+        // Truncate to 3 letters: bookings saved before the JourneyDate fix
+        // (Form1's dtpDate.ToString("dd-MMM-yyyy") without InvariantCulture)
+        // can have a 4-letter "Sept" baked in on machines whose culture
+        // abbreviates September that way — IRCTC's own carousel always
+        // shows the 3-letter "Sep", so "SEPT" would never match it.
+        var monthRaw = dp.Length > 1 ? dp[1].ToUpper() : "";
+        var month = monthRaw.Length > 3 ? monthRaw[..3] : monthRaw;
+        var dateBoxJs = DateBoxJs(b.TrainNo, day, month);
 
-        bool dateClicked = await ClickAsync($@"(function(){{
-  var day = '{day}', month = '{month}';
-  return Array.from(document.querySelectorAll('.pre-avl')).find(function(box){{
-    var label = box.querySelector('strong');
-    var t = ((label && label.textContent) || '').toUpperCase();
-    return t.includes(day) && t.includes(month) && !t.includes('DEPARTED');
-  }});
-}})()");
+        Report("Step 3 — Waiting for availability dates to load...");
+        bool dateReady = await WaitForAsync($"!!({dateBoxJs})", 12000, pollMs: 300);
+        await D(300); await InjectAsync();
+
+        Report($"Step 3 — Selecting date {day} {month}...");
+        bool dateClicked = dateReady && await ClickAsync(dateBoxJs);
 
         if (!dateClicked)
         {
@@ -1774,6 +1772,42 @@ true;";
     }}
   }}
   return findBox(document);  // fall back to a page-wide match rather than failing outright
+}})()";
+
+    // Finds the saved journey date's ".pre-avl" box scoped to a specific
+    // train's card — same ancestor-walk pattern as ClassBoxJs, so a date
+    // that happens to match on some OTHER train's already-loaded carousel
+    // (e.g. the same day of month on a different route) can't be picked
+    // instead of this train's own.
+    private static string DateBoxJs(string trainNo, string day, string month) => $@"(function(){{
+  function findDate(root){{
+    return Array.from(root.querySelectorAll('.pre-avl')).find(function(box){{
+      var label = box.querySelector('strong');
+      var t = ((label && label.textContent) || '').toUpperCase();
+      return t.includes('{day}') && t.includes('{month}') && !t.includes('DEPARTED');
+    }});
+  }}
+
+  var trainNo = '{trainNo}';
+  var labelEls = Array.from(document.querySelectorAll('*')).filter(function(e){{
+    return e.offsetParent!==null && e.children.length<=3 && (e.textContent||'').includes(trainNo);
+  }});
+  labelEls.sort(function(a,b){{ return (a.textContent||'').length-(b.textContent||'').length; }});
+  var trainEl = labelEls[0];
+
+  if (trainEl) {{
+    var anc = trainEl, hops = 0;
+    while (anc) {{
+      if (anc.querySelector && anc.querySelector('.pre-avl')) {{
+        var scoped = findDate(anc);
+        if (scoped) return scoped;
+        break;               // found the card but the target date isn't in it (yet)
+      }}
+      anc = anc.parentElement; hops++;
+      if (hops > 15) break;
+    }}
+  }}
+  return findDate(document);  // fall back to a page-wide match rather than failing outright
 }})()";
 
     // Finds the ENABLED "Book Now" button for a specific train. Every train

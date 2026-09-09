@@ -373,10 +373,17 @@ public class BookingManagerForm : Form
         // Enable/Disable Proxy — switches the live browser between direct
         // and proxy right here (no closing/reopening this window needed).
         // Label reflects current state; UpdateProxyToggleButton keeps it in
-        // sync after every change (Set, toggle, or load).
-        _btnToggleProxy.Size   = new Size(90, 28);
-        _btnToggleProxy.Margin = new Padding(0, 3, 0, 0);
-        _btnToggleProxy.Click += async (_, _) => await ToggleProxyAsync();
+        // sync after every change (Set, toggle, or load). AutoSize instead
+        // of a fixed width: "Proxy: OFF" clipped to just "Proxy:" on some
+        // DPI/font-rendering setups at a hand-picked 90px — since this
+        // control already lives in a FlowLayoutPanel, letting it size
+        // itself to its actual text removes that guess entirely.
+        _btnToggleProxy.AutoSize     = true;
+        _btnToggleProxy.AutoSizeMode = AutoSizeMode.GrowOnly;
+        _btnToggleProxy.MinimumSize  = new Size(0, 28);
+        _btnToggleProxy.Padding      = new Padding(10, 0, 10, 0);
+        _btnToggleProxy.Margin       = new Padding(0, 3, 0, 0);
+        _btnToggleProxy.Click       += async (_, _) => await ToggleProxyAsync();
         UpdateProxyToggleButton();
 
         row2.Controls.AddRange(new Control[]

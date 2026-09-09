@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Globalization;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.WinForms;
@@ -354,7 +355,13 @@ public partial class Form1 : Form
         dgvTrains.DataSource = null;
         lblStatus.Text       = "Searching IRCTC…";
 
-        var date     = dtpDate.Value.ToString("dd-MMM-yyyy");
+        // InvariantCulture, not the machine's current culture: "MMM" under
+        // some locales (e.g. en-GB's ICU data) abbreviates September as the
+        // 4-letter "Sept" instead of "Sep" — IRCTC's own date carousel
+        // always shows the 3-letter form, so a booking saved with "Sept"
+        // could never be matched against it (confirmed live: this was the
+        // actual cause of "date not found" errors, not just a timing race).
+        var date     = dtpDate.Value.ToString("dd-MMM-yyyy", CultureInfo.InvariantCulture);
         var progress = new Progress<string>(msg =>
             { if (!IsDisposed) lblStatus.Text = msg; });
 
@@ -448,7 +455,9 @@ public partial class Form1 : Form
 
         var (fromName, fromCode) = ResolveStation(txtFrom, _fromStn);
         var (toName,   toCode)   = ResolveStation(txtTo,   _toStn);
-        var date  = dtpDate.Value.ToString("dd-MMM-yyyy");
+        // InvariantCulture — see the comment at the other JourneyDate save
+        // site above (IRCTC's page always shows a 3-letter month).
+        var date  = dtpDate.Value.ToString("dd-MMM-yyyy", CultureInfo.InvariantCulture);
         var cls   = cmbClass.SelectedItem?.ToString() ?? "SL";
         var quota = cmbQuota.SelectedItem?.ToString() ?? "General Quota";
 
