@@ -20,6 +20,12 @@ public class SavedBooking
     public string   TravelClass { get; set; } = "SL";
     public string   Quota       { get; set; } = "GN";
     public List<Passenger> Passengers { get; set; } = new();
+    // Who saved this booking — Booking Manager uses it to show each
+    // non-admin user only their own bookings (VIEW_ALL_BOOKINGS is the
+    // permission that lifts that filter). Blank for bookings saved before
+    // this field existed; those are visible only to VIEW_ALL_BOOKINGS
+    // holders rather than guessed at.
+    public string   CreatedByUsername { get; set; } = "";
 
     [JsonIgnore]
     public static string StorePath =>

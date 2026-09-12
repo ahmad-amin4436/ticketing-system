@@ -1,7 +1,5 @@
 using System.Drawing;
-using System.IO;
 using System.Windows.Forms;
-using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
 namespace indian_ticketing;
@@ -9,7 +7,6 @@ namespace indian_ticketing;
 public class BookingManagerForm : Form
 {
     // ── Controls ──────────────────────────────────────────────────────────
-    private readonly SplitContainer _split       = new();
     private readonly Panel          _topBar      = new();
     private readonly Label          _lblTitle    = new();
     private readonly TextBox        _txtUser     = new();
@@ -23,17 +20,27 @@ public class BookingManagerForm : Form
     private readonly ToolTip        _sessionTip  = new();
     private readonly Button         _btnManageUsers = new();
     private readonly FlowLayoutPanel _cardPanel  = new();
-    private WebView2                _webView     = new();
 
     // ── State ─────────────────────────────────────────────────────────────
-    private List<SavedBooking>        _bookings = SavedBooking.LoadAll();
+    // No shared browser or session anymore — every booking gets its own
+    // isolated WebView2 (see StartBookingAsync), so bookings run in
+    // parallel instead of one at a time, and the IRCTC page isn't shown in
+    // this window at all (BookingCard.ToggleBrowserPopup reveals a specific
+    // one on demand instead).
+    // _allBookings is EVERY user's saved bookings — the true on-disk list,
+    // and the only one ever passed to SavedBooking.SaveAll (deleting must
+    // remove from and re-save the FULL list, never the filtered one below,
+    // or a non-admin's delete would silently wipe out every other user's
+    // bookings too). _bookings is the filtered subset actually shown —
+    // just this signed-in user's own, unless they hold VIEW_ALL_BOOKINGS.
+    private List<SavedBooking>        _allBookings = SavedBooking.LoadAll();
+    private List<SavedBooking>        _bookings    = new();
     private readonly List<BookingCard> _cards   = new();
-    private IrctcWebViewSession?       _session;
     private readonly ProxyConfig       _proxy   = ProxyConfig.Load();
-    // Tracks which network mode _webView is actually running on right now —
-    // set by SetupWebViewAsync — so a session created for booking can label
-    // its own Access-Denied diagnostics correctly (direct vs proxy).
-    private bool                       _usingProxy;
+    // The currently-running session for each card that has one — looked up
+    // by "OK (Continue)" to acknowledge the right booking's own manual-step
+    // prompt, now that each card can have an independent run in flight.
+    private readonly Dictionary<BookingCard, IrctcWebViewSession> _sessions = new();
 
     // One reusable QR popup window per booking — a refreshed QR replaces the
     // image in the existing window instead of opening a new one.
@@ -51,8 +58,6 @@ public class BookingManagerForm : Form
                 ? $"{_proxy.Host}:{_proxy.Port}:{_proxy.Username}:{_proxy.Password}"
                 : $"{_proxy.Host}:{_proxy.Port}";
         }
-        Shown += (_, _) => _split.SplitterDistance = 320;  // layout complete here
-        Load  += async (_, _) => await InitializeWebViewAsync();
         ApplyRolePermissions();
         RebuildCards();
     }
@@ -96,188 +101,6 @@ public class BookingManagerForm : Form
 
         if (!Session.Has("MANAGE_BOOKINGS"))
             _btnStartAll.Enabled = false;
-    }
-
-    private static string GetWebView2UserDataFolder()
-    {
-        return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Indian Ticketing",
-            "WebView2");
-    }
-
-    private async Task<bool> EvalBool(string js)
-    {
-        try
-        {
-            var r = await _webView.CoreWebView2.ExecuteScriptAsync(js);
-            return r.Trim('"') is "true" or "1";
-        }
-        catch { return false; }
-    }
-
-    // Use the explicitly configured network mode. A proxy is infrastructure
-    // configuration, never a fallback used to respond to an access block.
-    private async Task InitializeWebViewAsync() => await SetupWebViewAsync(useProxy: _proxy.IsConfigured);
-
-    private static bool IsProfileLockError(Exception ex)
-        => ex is System.Runtime.InteropServices.COMException com && (uint)com.HResult == 0x8007139F;
-
-    private async Task InitCoreWebView2Async(string dataFolder, bool useProxy)
-    {
-        Directory.CreateDirectory(dataFolder);
-        // No CreationProperties assignment here: it's only consulted by the
-        // control's OWN implicit init path, and only if set BEFORE the
-        // control gets a window handle (i.e. before it's added to a visible
-        // parent) — by the time this runs, _webView is already parented, so
-        // WebView2 has already begun its own init and setting this now
-        // throws "CreationProperties cannot be modified after the
-        // initialization of CoreWebView2 has begun." Passing an explicit
-        // environment to EnsureCoreWebView2Async(env) below (which already
-        // has dataFolder baked in) makes this assignment unnecessary anyway.
-
-        var envOptions = new CoreWebView2EnvironmentOptions();
-        if (useProxy)
-        {
-            var proxyArg = _proxy.GetProxyServerArg();
-            if (!string.IsNullOrEmpty(proxyArg))
-            {
-                envOptions.AdditionalBrowserArguments = proxyArg;
-            }
-        }
-
-        var env = await CoreWebView2Environment.CreateAsync(null, dataFolder, envOptions);
-        await _webView.EnsureCoreWebView2Async(env);
-        _webView.CoreWebView2.CookieManager.DeleteAllCookies();
-
-        // Auto-answer the native proxy-auth dialog ("Sign in to access this
-        // site") with the configured credentials, so it never blocks the UI
-        // waiting on a manual Username/Password/Sign in. IrctcWebViewSession
-        // already does this for the sessions IT initializes, but _webView is
-        // initialized directly by THIS form (booking sessions just reuse the
-        // already-created CoreWebView2), so it needs its own subscription too.
-        if (useProxy && _proxy.HasCredentials)
-        {
-            _webView.CoreWebView2.BasicAuthenticationRequested += (s, e) =>
-            {
-                e.Response.UserName = _proxy.Username;
-                e.Response.Password = _proxy.Password;
-            };
-        }
-
-        if (useProxy)
-        {
-            // Load proxy auth extension AFTER profile is available
-            var extPath = ProxyConfig.EnsureAuthExtension(_proxy);
-            if (extPath != null && _webView.CoreWebView2?.Profile != null)
-            {
-                try
-                {
-                    await _webView.CoreWebView2.Profile.AddBrowserExtensionAsync(extPath);
-                }
-                catch { /* Extension may already be loaded from a previous session */ }
-            }
-        }
-    }
-
-    private async Task SetupWebViewAsync(bool useProxy)
-    {
-        _usingProxy = useProxy;
-        var dataFolder = GetWebView2UserDataFolder();
-        try
-        {
-            try
-            {
-                await InitCoreWebView2Async(dataFolder, useProxy);
-            }
-            catch (Exception ex) when (IsProfileLockError(ex))
-            {
-                // HRESULT 0x8007139F: another process still holds this profile
-                // folder's lock (a WebView2 child process left running after an
-                // abrupt stop — common while iterating via a debugger). Fall
-                // back to a fresh, uniquely named profile for this run instead
-                // of failing hard.
-                dataFolder = $"{dataFolder}-{DateTime.Now:yyyyMMddHHmmss}";
-                await InitCoreWebView2Async(dataFolder, useProxy);
-            }
-
-            var core = _webView.CoreWebView2;
-            if (core == null) throw new InvalidOperationException("WebView2 initialization did not produce a browser core.");
-
-            // Capture edge/anti-bot signals for this initial load so an
-            // Access-Denied landing is diagnosed with its real response headers.
-            // The watcher must outlive the async NavigationCompleted handler,
-            // which fires after this method returns — so it's disposed there.
-            var akamai = new AkamaiDiagInfo();
-            var watcher = AccessDeniedDiagnostics.WatchAkamaiResponses(core, akamai);
-
-            core.Navigate("https://www.irctc.co.in/nget/train-search");
-
-            // Auto-fill login form if it appears on the initial page
-            core.NavigationCompleted += async (_, args) =>
-            {
-                watcher.Dispose();
-                if (!args.IsSuccess) return;
-                try
-                {
-                    await Task.Delay(3000); // wait for Angular to render
-                    await core.ExecuteScriptAsync(IrctcWebViewSession.HelperJs);
-
-                    bool blocked = await EvalBool(
-                        "__h.pageHas('Access Denied') && __h.pageHas('have permission')");
-                    if (blocked)
-                    {
-                        await AccessDeniedDiagnostics.CaptureAsync(_webView.CoreWebView2,
-                            AutomationFailureKind.AccessDenied, detail: "Initial navigation", useProxy: useProxy, proxy: _proxy, akamai: akamai);
-                        MessageBox.Show(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.AccessDenied),
-                            "IRCTC Access Denied", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return;
-                    }
-
-                    bool hasLogin = await EvalBool(
-                        @"__h.exists('input[placeholder=""User Name""]') ||
-                          __h.exists('input[formcontrolname=""userid""]') ||
-                          __h.pageHas('Please login') || __h.pageHas('Login to proceed')");
-
-                    if (hasLogin)
-                    {
-                        var u = _txtUser.Text.Trim();
-                        var p = _txtPass.Text.Trim();
-                        if (!string.IsNullOrEmpty(u) && !string.IsNullOrEmpty(p))
-                        {
-                            _session = new IrctcWebViewSession(_webView, _proxy, usingProxy: _usingProxy);
-                            await _session.LoginAsync(u, p);
-                        }
-                    }
-                }
-                catch { }
-            };
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(
-                $"Failed to initialize embedded browser.\n\n" +
-                $"Please ensure the application can write to this folder:\n{dataFolder}\n\n" +
-                $"Error: {ex.Message}",
-                "WebView2 Initialization Failed",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-        }
-    }
-
-    // Same constraint as above, generalized: switch the live browser between
-    // direct and proxy right here, without requiring the user to close and
-    // reopen the Booking Manager for a network-mode change to take effect.
-    private async Task SwitchWebViewNetworkModeAsync(bool useProxy)
-    {
-        var old = _webView;
-        _split.Panel2.Controls.Remove(old);
-        old.Dispose();
-
-        _webView = new WebView2 { Dock = DockStyle.Fill };
-        _split.Panel2.Controls.Add(_webView);
-
-        await SetupWebViewAsync(useProxy);
     }
 
     // ── UI construction ───────────────────────────────────────────────────
@@ -330,7 +153,7 @@ public class BookingManagerForm : Form
         _btnRefresh.Text = "Refresh";
         _btnRefresh.Margin = new Padding(0);
         UiTheme.StyleOnHeader(_btnRefresh);
-        _btnRefresh.Click += (_, _) => { _bookings = SavedBooking.LoadAll(); RebuildCards(); };
+        _btnRefresh.Click += (_, _) => { _allBookings = SavedBooking.LoadAll(); RebuildCards(); };
 
         actionsFlow.Controls.Add(_lblSession);
         actionsFlow.Controls.Add(_btnManageUsers);
@@ -368,13 +191,12 @@ public class BookingManagerForm : Form
         _btnSaveProxy.Text   = "Set";
         _btnSaveProxy.Margin = new Padding(0, 3, 8, 0);
         UiTheme.StyleOnHeader(_btnSaveProxy);
-        _btnSaveProxy.Click += async (_, _) => await SaveProxyFromTextBoxAsync();
+        _btnSaveProxy.Click += (_, _) => SaveProxyFromTextBox();
 
-        // Enable/Disable Proxy — switches the live browser between direct
-        // and proxy right here (no closing/reopening this window needed).
-        // Label reflects current state; UpdateProxyToggleButton keeps it in
-        // sync after every change (Set, toggle, or load). AutoSize instead
-        // of a fixed width: "Proxy: OFF" clipped to just "Proxy:" on some
+        // Enable/Disable Proxy — just flips the saved setting; each booking
+        // reads it fresh when it creates its own browser, so there's no
+        // live shared browser here to reconfigure. AutoSize instead of a
+        // fixed width: "Proxy: OFF" clipped to just "Proxy:" on some
         // DPI/font-rendering setups at a hand-picked 90px — since this
         // control already lives in a FlowLayoutPanel, letting it size
         // itself to its actual text removes that guess entirely.
@@ -383,7 +205,7 @@ public class BookingManagerForm : Form
         _btnToggleProxy.MinimumSize  = new Size(0, 28);
         _btnToggleProxy.Padding      = new Padding(10, 0, 10, 0);
         _btnToggleProxy.Margin       = new Padding(0, 3, 0, 0);
-        _btnToggleProxy.Click       += async (_, _) => await ToggleProxyAsync();
+        _btnToggleProxy.Click       += (_, _) => ToggleProxy();
         UpdateProxyToggleButton();
 
         row2.Controls.AddRange(new Control[]
@@ -395,62 +217,68 @@ public class BookingManagerForm : Form
         _topBar.Controls.Add(row2);
         _topBar.Controls.Add(row1);
 
-        // Split container — SplitterDistance set in Shown (layout is complete by then)
-        _split.Dock          = DockStyle.Fill;
-        _split.Panel1MinSize = 280;
-        _split.Panel2MinSize = 100;
-        _split.BorderStyle   = BorderStyle.None;
-        _split.BackColor     = UiTheme.Border; // shows through as a thin splitter line
-
-        // Left: scrollable card panel
+        // The card list now fills the whole window — no more split-off
+        // browser pane. Each booking's IRCTC page is hidden by default and
+        // only shown via that card's own "Show Browser" button.
         _cardPanel.Dock          = DockStyle.Fill;
         _cardPanel.FlowDirection = FlowDirection.TopDown;
         _cardPanel.AutoScroll    = true;
         _cardPanel.WrapContents  = false;
         _cardPanel.BackColor     = UiTheme.Background;
         _cardPanel.Padding       = new Padding(8, 8, 8, 8);
-        _split.Panel1.Controls.Add(_cardPanel);
-
-        // Right: WebView2 (embedded IRCTC browser)
-        _webView.Dock = DockStyle.Fill;
-        _split.Panel2.Controls.Add(_webView);
 
         // Form
-        Controls.Add(_split);
+        Controls.Add(_cardPanel);
         Controls.Add(_topBar);
         BackColor    = UiTheme.Background;
         ClientSize   = new Size(1200, 680);
         MinimumSize  = new Size(920, 480);
         Text         = "IRCTC Booking Manager";
         StartPosition = FormStartPosition.CenterScreen;
+
+        Resize += (_, _) => ResizeCards();
+    }
+
+    private void ResizeCards()
+    {
+        foreach (BookingCard c in _cardPanel.Controls)
+            c.Width = _cardPanel.ClientSize.Width - 12;
     }
 
     // ── Card builder ──────────────────────────────────────────────────────
     private void RebuildCards()
     {
+        // VIEW_ALL_BOOKINGS (Admin by default) sees every user's saved
+        // bookings; everyone else only sees their own (CreatedByUsername).
+        // A booking saved before that field existed has it blank, so it
+        // only shows up for VIEW_ALL_BOOKINGS holders rather than being
+        // guessed at or shown to everyone.
+        var me = Session.CurrentUser?.Username ?? "";
+        _bookings = Session.Has("VIEW_ALL_BOOKINGS")
+            ? _allBookings
+            : _allBookings.Where(b => b.CreatedByUsername == me).ToList();
+
         foreach (var c in _cards) c.Dispose();
         _cards.Clear();
+        _sessions.Clear();
         _cardPanel.Controls.Clear();
 
         foreach (var b in _bookings)
         {
             var card = new BookingCard(b);
-            card.Width = _split.Panel1.ClientSize.Width - 12;
-            card.OnBookClicked   += () => StartBooking(b, card);
-            card.OnAckClicked    += () => _session?.AcknowledgeUserAction();
-            card.OnDeleteClicked += () => { _bookings.Remove(b); SavedBooking.SaveAll(_bookings); RebuildCards(); };
+            card.Width = _cardPanel.ClientSize.Width - 12;
+            card.OnBookClicked   += () => _ = StartBookingAsync(b, card);
+            card.OnAckClicked    += () => { if (_sessions.TryGetValue(card, out var s)) s.AcknowledgeUserAction(); };
+            // Removes from the FULL list (every user's bookings), not the
+            // filtered _bookings view — deleting your own booking must not
+            // wipe everyone else's out of the saved file.
+            card.OnDeleteClicked += () => { _allBookings.Remove(b); SavedBooking.SaveAll(_allBookings); RebuildCards(); };
             // Users without MANAGE_BOOKINGS can view cards but not start or
             // delete bookings.
             card.SetActionsEnabled(Session.Has("MANAGE_BOOKINGS"));
             _cardPanel.Controls.Add(card);
             _cards.Add(card);
         }
-
-        _split.Panel1.Resize += (_, _) =>
-        {
-            foreach (BookingCard c in _cardPanel.Controls)
-                c.Width = _split.Panel1.ClientSize.Width - 12;
-        };
     }
 
     // Show the captured UPI QR in its own always-on-top window (reused per booking).
@@ -483,7 +311,7 @@ public class BookingManagerForm : Form
     }
 
     // ── Proxy config ──────────────────────────────────────────────────────
-    private async Task SaveProxyFromTextBoxAsync()
+    private void SaveProxyFromTextBox()
     {
         var text = _txtProxy.Text.Trim();
 
@@ -508,8 +336,7 @@ public class BookingManagerForm : Form
             _proxy.Username = ""; _proxy.Password = "";
             ProxyConfig.Save(_proxy);
             UpdateProxyToggleButton();
-            await SwitchWebViewNetworkModeAsync(useProxy: false);
-            MessageBox.Show("Proxy cleared. All requests will go direct.",
+            MessageBox.Show("Proxy cleared. Bookings started after this will go direct.",
                 "Proxy", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -522,7 +349,6 @@ public class BookingManagerForm : Form
         _proxy.Password = parsed.Password;
         ProxyConfig.Save(_proxy);
         UpdateProxyToggleButton();
-        await SwitchWebViewNetworkModeAsync(useProxy: true);
 
         // Show diagnostic summary
         var diag = _proxy.DiagnosticSummary();
@@ -531,12 +357,15 @@ public class BookingManagerForm : Form
             diag += $"\n\nProxy auth extension will be loaded at browser startup.";
         }
 
-        MessageBox.Show(diag, "Proxy Saved — now active", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        MessageBox.Show(
+            diag + "\n\nEach booking creates its own browser when started, so this " +
+            "takes effect for bookings started from now on (not ones already running).",
+            "Proxy Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     // Flips Enabled without touching the saved host/port/credentials, so
     // switching off and back on later doesn't require retyping the address.
-    private async Task ToggleProxyAsync()
+    private void ToggleProxy()
     {
         if (!_proxy.Enabled && (string.IsNullOrWhiteSpace(_proxy.Host) || _proxy.Port <= 0))
         {
@@ -548,7 +377,6 @@ public class BookingManagerForm : Form
         _proxy.Enabled = !_proxy.Enabled;
         ProxyConfig.Save(_proxy);
         UpdateProxyToggleButton();
-        await SwitchWebViewNetworkModeAsync(useProxy: _proxy.IsConfigured);
     }
 
     private void UpdateProxyToggleButton()
@@ -559,7 +387,14 @@ public class BookingManagerForm : Form
     }
 
     // ── Booking logic ─────────────────────────────────────────────────────
-    private async void StartBooking(SavedBooking booking, BookingCard card)
+    // Each booking gets its own WebView2 + IrctcWebViewSession, isolated by
+    // profile folder — this is what actually makes parallel bookings
+    // possible (one shared browser can only run one script at a time; N
+    // independent ones can run N bookings genuinely at once). The browser
+    // is created off-screen (hidden per the "hide the IRCTC screen"
+    // requirement) and handed to the card so its "Show Browser" button can
+    // reveal it on demand if a manual step is needed.
+    private async Task StartBookingAsync(SavedBooking booking, BookingCard card)
     {
         var u = _txtUser.Text.Trim();
         var p = _txtPass.Text.Trim();
@@ -571,41 +406,71 @@ public class BookingManagerForm : Form
         }
 
         card.SetBooking(true);
-        _session = new IrctcWebViewSession(_webView, _proxy, usingProxy: _usingProxy);
-        _session.OnStatus  += msg => this.Invoke(() => card.SetStatus(msg));
-        _session.OnQrReady += bmp => this.Invoke(() => { card.ShowQr(bmp); ShowQrPopup(booking, bmp); });
-        _session.OnQrGone  += ()  => this.Invoke(() => CloseQrPopup(booking));
 
-        await _session.RunAsync(booking, u, p);
-        card.SetBooking(false);
+        var cardWebView = new WebView2 { Size = new Size(1280, 900), Location = new Point(-3000, -3000) };
+        Controls.Add(cardWebView);
+        card.AttachWebView(cardWebView);
+
+        var session = new IrctcWebViewSession(
+            cardWebView, _proxy, profileFolderName: $"WebView2-Booking-{booking.Id}", usingProxy: _proxy.IsConfigured);
+        _sessions[card] = session;
+        session.OnStatus  += msg => this.Invoke(() => card.SetStatus(msg));
+        session.OnQrReady += bmp => this.Invoke(() => { card.ShowQr(bmp); ShowQrPopup(booking, bmp); });
+        session.OnQrGone  += ()  => this.Invoke(() => CloseQrPopup(booking));
+
+        try
+        {
+            await session.RunAsync(booking, u, p);
+        }
+        finally
+        {
+            card.SetBooking(false);
+            _sessions.Remove(card);
+        }
     }
 
-    private void StartAllBookings()
+    // Gap between launching each successive booking from "Start All" —
+    // enough that N WebView2 instances aren't all spinning up and hitting
+    // IRCTC in the exact same instant (that's just a burst of simultaneous
+    // process/network start-up, nothing to do with pacing requests against
+    // the site once each session is running), while still small enough that
+    // "Start All" finishes dispatching everything in a few seconds.
+    private const int StartAllStaggerMs = 4000;
+
+    // Starts every booking's card with a short stagger between each launch
+    // (not one-after-another waiting for completion, and not all in the
+    // same instant either) — each still runs against its own isolated
+    // browser once started, so they proceed genuinely in parallel from
+    // there.
+    //
+    // Real-world caveat worth knowing before relying on this: IRCTC's own
+    // site enforces a single active login session per account. Running the
+    // SAME IRCTC account logged in from several parallel browsers at once
+    // may get earlier sessions logged out by IRCTC itself, independent of
+    // anything this app does — that's a constraint of the real site, not
+    // something fixable here.
+    private async void StartAllBookings()
     {
-        if (_cards.Count == 0) return;
-        // Chain: start first, then each subsequent one when the previous finishes
-        StartChain(0);
+        var pairs = _bookings.Zip(_cards).ToList();
+        for (int i = 0; i < pairs.Count; i++)
+        {
+            var (b, c) = pairs[i];
+            _ = StartBookingAsync(b, c);
+            if (i < pairs.Count - 1)
+                await Task.Delay(StartAllStaggerMs);
+        }
     }
 
-    private async void StartChain(int index)
+    // Entry point for Form1's daily scheduler — same action as clicking
+    // "Start All Bookings" by hand, still gated by whatever permission the
+    // currently signed-in user actually has (the scheduler doesn't bypass
+    // the rights system, it just fires within the already-open session
+    // instead of waiting for a click).
+    public bool TriggerAutoStartAll()
     {
-        if (index >= _bookings.Count) return;
-        var u = _txtUser.Text.Trim();
-        var p = _txtPass.Text.Trim();
-        var b = _bookings[index];
-        var c = _cards[index];
-
-        c.SetBooking(true);
-        _session = new IrctcWebViewSession(_webView, _proxy, usingProxy: _usingProxy);
-        _session.OnStatus  += msg => this.Invoke(() => c.SetStatus(msg));
-        _session.OnQrReady += bmp => this.Invoke(() => { c.ShowQr(bmp); ShowQrPopup(b, bmp); });
-        _session.OnQrGone  += ()  => this.Invoke(() => CloseQrPopup(b));
-
-        await _session.RunAsync(b, u, p);
-        c.SetBooking(false);
-
-        // Move to next booking
-        StartChain(index + 1);
+        if (!Session.Has("MANAGE_BOOKINGS")) return false;
+        StartAllBookings();
+        return true;
     }
 }
 
@@ -619,7 +484,17 @@ public class BookingCard : Panel
     private readonly Button     _btnBook;
     private readonly Button     _btnAck;
     private readonly Button     _btnDel;
+    private readonly Button     _btnShowBrowser;
     private readonly PictureBox _picQr;
+
+    // Each booking now runs its own isolated WebView2 (parallel bookings
+    // can't share one browser), kept off-screen by default per the "hide
+    // the IRCTC screen" requirement — "Show Browser" reparents it into a
+    // popup on demand for the rare case Step-by-step automation needs a
+    // human to click something it couldn't find itself (the "click
+    // manually, then OK" messages this app has always shown).
+    private WebView2? _webView;
+    private BookingBrowserForm? _browserPopup;
 
     public event Action? OnBookClicked;
     public event Action? OnAckClicked;
@@ -705,8 +580,55 @@ public class BookingCard : Panel
             Visible     = false,
         };
 
+        // Off by default (the IRCTC browser is hidden) — only lights up
+        // once this card's booking has actually started and has a live
+        // WebView2 for it to show (see AttachWebView).
+        // VIEW_BROWSER-gated (Admin by default) — an Operator can watch a
+        // booking's status/QR but not pop open its live IRCTC session.
+        _btnShowBrowser = new Button
+        {
+            Location = new Point(456, 8), Size = new Size(96, 27),
+            Text     = "Show Browser", Enabled = false,
+            Visible  = Session.Has("VIEW_BROWSER"),
+        };
+        UiTheme.StyleSecondary(_btnShowBrowser);
+        _btnShowBrowser.Click += (_, _) => ToggleBrowserPopup(b);
+
         Controls.AddRange(new Control[]
-            { _lblTrain, _lblPax, _lblStatus, _btnBook, _btnAck, _btnDel, _picQr, _statusStrip });
+            { _lblTrain, _lblPax, _lblStatus, _btnBook, _btnAck, _btnDel, _btnShowBrowser, _picQr, _statusStrip });
+    }
+
+    // Called by BookingManagerForm right after it creates this card's own
+    // WebView2 (one per booking, so parallel bookings each get an
+    // independent browser instead of contending for one shared session).
+    public void AttachWebView(WebView2 wv)
+    {
+        _webView = wv;
+        _btnShowBrowser.Enabled = true;
+    }
+
+    private void ToggleBrowserPopup(SavedBooking b)
+    {
+        if (_webView == null) return;
+
+        if (_browserPopup != null && !_browserPopup.IsDisposed)
+        {
+            _browserPopup.Close();
+            return;
+        }
+
+        _browserPopup = new BookingBrowserForm($"[{b.TrainNo}] {b.TrainName}", _webView);
+        _browserPopup.FormClosed += (_, _) =>
+        {
+            // Hand the webview back to this card (off-screen, hidden again)
+            // instead of letting it get disposed with the popup.
+            if (IsDisposed) return;
+            _webView.Dock = DockStyle.None;
+            Controls.Add(_webView);
+            _webView.Size     = new Size(1280, 900);
+            _webView.Location = new Point(-3000, -3000);
+        };
+        _browserPopup.Show();
     }
 
     public void SetStatus(string msg)
@@ -752,5 +674,15 @@ public class BookingCard : Panel
     {
         _btnBook.Enabled = enabled;
         _btnDel.Enabled  = enabled;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            if (_browserPopup != null && !_browserPopup.IsDisposed) _browserPopup.Close();
+            _webView?.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }

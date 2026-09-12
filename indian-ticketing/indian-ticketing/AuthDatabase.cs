@@ -27,6 +27,9 @@ public static class AuthDatabase
         ("MANAGE_CREDENTIALS", "Edit IRCTC login credentials and proxy settings"),
         ("MANAGE_BOOKINGS",    "Start, delete, and manage saved bookings"),
         ("MANAGE_USERS",       "Create/edit/delete users and manage roles"),
+        ("MANAGE_SCHEDULE",    "Configure the daily automatic booking time"),
+        ("VIEW_BROWSER",       "Reveal a booking's hidden IRCTC browser window"),
+        ("VIEW_ALL_BOOKINGS",  "See every user's saved bookings, not just your own"),
     };
 
     public static void EnsureReady(DbConfig cfg)
@@ -34,6 +37,18 @@ public static class AuthDatabase
         EnsureDatabaseExists(cfg);
         EnsureSchema(cfg);
         SeedDefaultRolesAndPermissions(cfg);
+        SeedScheduleRow(cfg);
+    }
+
+    private static void SeedScheduleRow(DbConfig cfg)
+    {
+        using var conn = new SqlConnection(cfg.ConnectionString());
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+IF NOT EXISTS (SELECT 1 FROM dbo.ScheduleSettings WHERE Id = 1)
+    INSERT INTO dbo.ScheduleSettings (Id, Enabled, TriggerTime) VALUES (1, 0, '10:00:00');";
+        cmd.ExecuteNonQuery();
     }
 
     private static void EnsureDatabaseExists(DbConfig cfg)
@@ -92,6 +107,19 @@ BEGIN
         IsActive     BIT            NOT NULL DEFAULT 1,
         CreatedAt    DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
     );
+END
+
+IF OBJECT_ID('dbo.ScheduleSettings') IS NULL
+BEGIN
+    -- Single-row table (Id always 1) holding the daily auto-booking trigger
+    -- time. LastTriggeredDate stops it firing twice on the same day even
+    -- across an app restart.
+    CREATE TABLE dbo.ScheduleSettings (
+        Id                INT       NOT NULL PRIMARY KEY DEFAULT 1 CHECK (Id = 1),
+        Enabled           BIT       NOT NULL DEFAULT 0,
+        TriggerTime       TIME      NOT NULL DEFAULT '10:00:00',
+        LastTriggeredDate DATE      NULL
+    );
 END";
         cmd.ExecuteNonQuery();
     }
@@ -130,7 +158,9 @@ IF NOT EXISTS (SELECT 1 FROM dbo.Permissions WHERE PermissionCode = @code)
         foreach (var (code, _) in AllPermissions)
             GrantPermission(conn, adminRoleId, code);
 
-        // Operator: everything except user/role management.
+        // Operator: everything except user/role management, the
+        // auto-booking schedule, revealing a booking's hidden browser, and
+        // seeing other users' bookings — those stay Admin-only by default.
         GrantPermission(conn, operatorRoleId, "MANAGE_CREDENTIALS");
         GrantPermission(conn, operatorRoleId, "MANAGE_BOOKINGS");
     }

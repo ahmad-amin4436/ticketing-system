@@ -57,12 +57,19 @@ public partial class Form1 : Form
     private ListBox _toDropList    = null!;
     private bool    _suppressAC    = false;
 
+    // ── Daily auto-booking scheduler ────────────────────────────────────────
+    private BookingManagerForm? _bookingManagerForm;
+    private readonly System.Windows.Forms.Timer _schedulerTimer = new() { Interval = 20_000 };
+    private bool _schedulerTriggering; // reentrancy guard while a scheduled run is being launched
+    private Button _btnSchedule = null!;
+
     public Form1()
     {
         InitializeComponent();
         BuildColumns();
         dgvTrains.CellFormatting += DgvTrains_CellFormatting;
         InitAutocomplete();
+        BuildScheduleButton();
 
         Controls.Add(_webView);
         _webView.BringToFront();
@@ -73,6 +80,83 @@ public partial class Form1 : Form
         // anything yet, instead of making the very first character typed
         // into From/To wait for all of it.
         _ = PrewarmStationLookupAsync();
+
+        _schedulerTimer.Tick += async (_, _) => await SchedulerTickAsync();
+        _schedulerTimer.Start();
+    }
+
+    // "Schedule" button — Admin-side control for the daily auto-booking
+    // time (MANAGE_SCHEDULE). Lives in the bottom status bar rather than the
+    // already-tight search bar, so adding it can't reopen the overlap class
+    // of bug that bar has had before.
+    private void BuildScheduleButton()
+    {
+        _btnSchedule = new Button
+        {
+            Text = "Schedule", AutoSize = true,
+            Dock = DockStyle.Right, // let WinForms' own layout engine place it, not a manually-tracked Location
+            Visible = Session.Has("MANAGE_SCHEDULE"),
+        };
+        UiTheme.StyleOnHeader(_btnSchedule);
+        _btnSchedule.Click += (_, _) => new ScheduleSettingsForm().ShowDialog(this);
+
+        // Added AFTER lblStatus (which docks Fill): a later-added docked
+        // control claims its edge first and the Fill sibling takes what's
+        // left — this recalculates on every resize automatically, unlike
+        // the fixed Location this used to compute once from pnlStatus's
+        // width at construction time (before the form had ever been
+        // through a real layout pass, so it always came out wrong).
+        pnlStatus.Controls.Add(_btnSchedule);
+    }
+
+    // Checked every 20s: has the admin-configured daily time passed, and
+    // hasn't today already been triggered? Fires "Start All Bookings" in
+    // Booking Manager exactly the way clicking it by hand would — this
+    // requires the app to be open with someone already signed in whose
+    // role has MANAGE_BOOKINGS; it does not run unattended with nobody
+    // logged in (see the in-app-scheduler scope this was built to).
+    private async Task SchedulerTickAsync()
+    {
+        if (_schedulerTriggering || Session.CurrentUser == null) return;
+
+        ScheduleSettings settings;
+        try { settings = ScheduleRepository.Get(); }
+        catch { return; } // DB unreachable this tick — just retry next tick
+
+        if (!settings.Enabled) return;
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        if (settings.LastTriggeredDate == today) return;
+        if (DateTime.Now.TimeOfDay < settings.TriggerTime) return;
+
+        _schedulerTriggering = true;
+        try
+        {
+            ScheduleRepository.MarkTriggeredToday(); // mark first — don't retry-storm if the run itself fails
+            await TriggerScheduledBookingAsync();
+        }
+        finally { _schedulerTriggering = false; }
+    }
+
+    private async Task TriggerScheduledBookingAsync()
+    {
+        lblStatus.Text = "Scheduled time reached — opening Booking Manager...";
+
+        if (_bookingManagerForm == null || _bookingManagerForm.IsDisposed)
+        {
+            _bookingManagerForm = new BookingManagerForm();
+            _bookingManagerForm.Show(this);
+            await Task.Delay(300); // let it finish laying out before the cards are used
+        }
+        else
+        {
+            _bookingManagerForm.WindowState = FormWindowState.Normal;
+            _bookingManagerForm.BringToFront();
+        }
+
+        bool started = _bookingManagerForm.TriggerAutoStartAll();
+        lblStatus.Text = started
+            ? "Scheduled booking run started."
+            : "Scheduled booking time reached, but the signed-in user can't start bookings.";
     }
 
     // ── Autocomplete ─────────────────────────────────────────────────────────
@@ -492,6 +576,7 @@ public partial class Form1 : Form
                 JourneyDate = date,
                 TravelClass = clsCode,
                 Quota       = quotaCode,
+                CreatedByUsername = Session.CurrentUser?.Username ?? "",
             };
             saved.Add(booking);
         }
@@ -518,7 +603,16 @@ public partial class Form1 : Form
     // ── Booking Manager button ────────────────────────────────────────────────
     private void btnBookingMgr_Click(object? sender, EventArgs e)
     {
-        new BookingManagerForm().Show(this);
+        // Reuse the same tracked instance the scheduler uses, rather than
+        // opening a second Booking Manager window on top of one already open.
+        if (_bookingManagerForm != null && !_bookingManagerForm.IsDisposed)
+        {
+            _bookingManagerForm.WindowState = FormWindowState.Normal;
+            _bookingManagerForm.BringToFront();
+            return;
+        }
+        _bookingManagerForm = new BookingManagerForm();
+        _bookingManagerForm.Show(this);
     }
 
     // ── Swap button ───────────────────────────────────────────────────────────

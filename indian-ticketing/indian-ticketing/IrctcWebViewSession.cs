@@ -30,6 +30,16 @@ public class AutomationSiteFailureException : Exception
     public AutomationSiteFailureException(AutomationFailureKind kind) : base(AccessDeniedDiagnostics.UserMessage(kind)) => Kind = kind;
 }
 
+// Thrown when IRCTC bounces the flow to its "Sorry!! Please Try again !!!" /
+// "Click here to login" page — a rejected session/transaction, not a normal
+// failure. RunAsync catches this specifically to click through and restart
+// the whole booking from the top rather than giving up (see BookingFailedJs
+// and RunAsync's retry loop).
+public class BookingBouncedException : Exception
+{
+    public BookingBouncedException(string detail) : base(detail) { }
+}
+
 /// <summary>
 /// Automates the complete IRCTC booking workflow (Steps 1-10):
 ///   1  Open IRCTC + apply saved search filters + Search
@@ -219,67 +229,64 @@ true;";
         }
     }
 
+    // Fallback IRCTC accounts to rotate through when a booking keeps getting
+    // bounced to the "Sorry, please Try Again" page — rather than clicking
+    // through and hammering the SAME account again, each restart tries the
+    // next account here. All share one password (as given). This list is
+    // consulted only for the retries; whatever account Booking Manager's
+    // USER/PASS fields actually pass into RunAsync is always tried first.
+    private static readonly (string User, string Pass)[] FallbackAccounts =
+    {
+        ("SEJAL108", "Radharani@89"),
+        ("SEJAL115", "Radharani@89"),
+        ("SEJAL117", "Radharani@89"),
+        ("SEJAL118", "Radharani@89"),
+    };
+
     public async Task RunAsync(SavedBooking booking, string username, string password)
     {
         try
         {
             await EnsureCoreWebView2Async();
-            _lastUser = username;
-            _lastPass = password;
 
-            // ── Step 1 — Open IRCTC and search (NO login yet) ─────────────
-            Report("Step 1 — Opening IRCTC...");
-            await NavAsync("https://www.irctc.co.in/nget/train-search");
-            await D(1500); await InjectAsync();   // NavAsync already awaited load
+            // Build the rotation: the configured account first, then every
+            // fallback account not already equal to it, in the order given
+            // above. Retries stop once every account in this list has been
+            // tried once — that cap is what keeps this from looping forever
+            // against a genuinely down/rejecting site.
+            var accounts = new List<(string User, string Pass)> { (username, password) };
+            foreach (var acc in FallbackAccounts)
+                if (!accounts.Any(a => string.Equals(a.User, acc.User, StringComparison.OrdinalIgnoreCase)))
+                    accounts.Add(acc);
 
-            // This booking flow previously had NO Access-Denied check at all
-            // (unlike Form1's search, which does) — a block here meant every
-            // later step just failed with vague "not found"/timeout messages
-            // instead of a clear reason, and nothing was ever logged to
-            // AccessDeniedDiagnostics for this path. Check and stop cleanly.
-            bool blocked = await ExecBool("__h.pageHas('Access Denied') && __h.pageHas('have permission')");
-            if (blocked)
+            for (int attempt = 1; attempt <= accounts.Count; attempt++)
             {
-                await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2,
-                    AutomationFailureKind.AccessDenied, detail: "Booking workflow initial navigation", useProxy: _usingProxy, proxy: _proxy, akamai: _lastAkamai);
-                Report(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.AccessDenied));
-                return;
+                var (curUser, curPass) = accounts[attempt - 1];
+                _lastUser = curUser;
+                _lastPass = curPass;
+
+                try
+                {
+                    await RunBookingStepsAsync(booking, curUser, curPass);
+                    return; // reached the end of the flow (QR shown, or a normal stop) — done
+                }
+                catch (BookingBouncedException ex)
+                {
+                    Report($"IRCTC bounced the booking to its \"Sorry, please Try Again\" page ({ex.Message}), account {curUser}.");
+                    if (attempt >= accounts.Count)
+                    {
+                        Report($"Gave up after trying all {accounts.Count} account(s) — IRCTC kept rejecting the booking. " +
+                               "Please try again later.");
+                        return;
+                    }
+                    var next = accounts[attempt];
+                    Report($"Clicking \"Click here to login\" and restarting the booking with account {next.User} " +
+                           $"(attempt {attempt + 1} of {accounts.Count})...");
+                    await ClickLoginRetryLinkAsync();
+                    await D(1500);
+                    // loop restarts the whole flow from Step 1 with the next account
+                }
             }
-
-            await DismissLanguageAlertAsync();    // "Alert" Hindi/English popup, if shown
-
-            // ── Step 0 — Log in FIRST, before touching the search form ─────
-            await Step0_LoginFirstAsync(username, password);
-            // (Step1_SearchAsync checks for an unsolicited LOGIN popup itself,
-            // right at its own start, in case one shows up mid-form-fill even
-            // after this — checking again here would just be the same check
-            // twice back-to-back with no page activity in between.)
-
-            await Step1_SearchAsync(booking);           // search with saved filters
-
-            // ── Steps 2-3-4 — Select train → class → date → Book Now → Yes ─
-            await Step2_3_4_SelectTrainClassDateBookAsync(booking);
-
-            // ── Step 5 — Login form appears HERE (after Book Now) ─────────
-            await Step5_ReLoginAsync();                 // fill credentials
-
-            // ── Step 6 — Passenger details → Continue Booking ─────────────
-            await Step6_PassengersAsync(booking);
-
-            // ── Step 6b — Payment-method page: pick BHIM/UPI → Continue ───
-            await Step6b_SelectPaymentMethodAsync();
-
-            // ── Step 7 — Stop for user-managed CAPTCHA/challenge ─────────
-            await Step7_ResolveCaptchaAsync();
-
-            // ── Step 8 — Click Continue → "Pay & Book" page ──────────────
-            await Step8_ContinueToReviewAsync();
-
-            // ── Step 9 — Click Pay & Book → gateway redirect ─────────────
-            await Step9_PayAndBookAsync();
-
-            // ── Step 10 — Extract UPI QR and show in popup ───────────────
-            await Step10_CaptureQrAsync();
         }
         catch (AutomationSiteFailureException ex) { Report(ex.Message); }
         catch (AutomationChallengeException ex)
@@ -300,6 +307,147 @@ true;";
                 detail: ex.Message, useProxy: _usingProxy, proxy: _proxy);
             Report($"Error: {ex.Message}");
         }
+    }
+
+    // Clicks IRCTC's "Click here to login." link on its bounce page. Confirmed
+    // via a live DOM dump of the actual "Sorry!!! Please Try again!!" page:
+    //   <div class="hero-unit error-center"> ... <ul class="error-lst">...</ul>
+    //     <a class="btn btn-large btn-info" href="">
+    //       <i class="icon-home icon-white"></i>Click here to login.
+    //     </a>
+    //   </div>
+    // Tries the exact confirmed selector first, then the exact confirmed
+    // text, then a looser "mentions login" match as a last-resort fallback
+    // in case IRCTC changes this page's markup later.
+    private Task<bool> ClickLoginRetryLinkAsync() => ClickDomAsync(@"
+      document.querySelector('.error-center a.btn-info, a.btn-info') ||
+      Array.from(document.querySelectorAll('a,button')).find(function(e){
+        var t=(e.innerText||e.textContent||'').trim().toLowerCase();
+        return t.indexOf('click here to login')!==-1 && e.offsetParent!==null;
+      }) ||
+      Array.from(document.querySelectorAll('a,button,span,div')).find(function(e){
+        var t=(e.innerText||e.textContent||'').trim().toLowerCase();
+        return t.length>0 && t.length<40 && t.indexOf('login')!==-1 && e.offsetParent!==null;
+      })
+    ");
+
+    // The whole Steps 1-10 sequence, extracted so RunAsync can retry it from
+    // the top when IRCTC bounces the booking to its "Sorry, please Try
+    // Again" page (see BookingBouncedException / MaxBookingBounceRestarts).
+    // BookingFailedJs is checked after every major step transition — not
+    // just at Step 9/10 — since that page can appear at any point once a
+    // session/transaction has actually been rejected server-side.
+    private async Task RunBookingStepsAsync(SavedBooking booking, string username, string password)
+    {
+        // ── Step 1 — Open IRCTC and search (NO login yet) ─────────────
+        Report("Step 1 — Opening IRCTC...");
+        await NavAsync("https://www.irctc.co.in/nget/train-search");
+        await D(1500); await InjectAsync();   // NavAsync already awaited load
+
+        // This booking flow previously had NO Access-Denied check at all
+        // (unlike Form1's search, which does) — a block here meant every
+        // later step just failed with vague "not found"/timeout messages
+        // instead of a clear reason, and nothing was ever logged to
+        // AccessDeniedDiagnostics for this path. Check and stop cleanly.
+        bool blocked = await ExecBool("__h.pageHas('Access Denied') && __h.pageHas('have permission')");
+        if (blocked)
+        {
+            await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2,
+                AutomationFailureKind.AccessDenied, detail: "Booking workflow initial navigation", useProxy: _usingProxy, proxy: _proxy, akamai: _lastAkamai);
+            Report(AccessDeniedDiagnostics.UserMessage(AutomationFailureKind.AccessDenied));
+            return;
+        }
+
+        await DismissLanguageAlertAsync();    // "Alert" Hindi/English popup, if shown
+
+        // ── Step 0 — Log in FIRST, before touching the search form ─────
+        await Step0_LoginFirstAsync(username, password);
+        // (Step1_SearchAsync checks for an unsolicited LOGIN popup itself,
+        // right at its own start, in case one shows up mid-form-fill even
+        // after this — checking again here would just be the same check
+        // twice back-to-back with no page activity in between.)
+
+        await Step1_SearchAsync(booking);           // search with saved filters
+        await ThrowIfBouncedAsync("Step 1 — search");
+
+        // ── Steps 2-3-4 — Select train → class → date → Book Now → Yes ─
+        await Step2_3_4_SelectTrainClassDateBookAsync(booking);
+        await ThrowIfBouncedAsync("Steps 2-4 — select train/class/date");
+
+        // ── Step 5 — Login form appears HERE (after Book Now) ─────────
+        await Step5_ReLoginAsync();                 // fill credentials
+        await ThrowIfBouncedAsync("Step 5 — re-login");
+
+        // ── Step 6 — Passenger details → Continue Booking ─────────────
+        await Step6_PassengersAsync(booking);
+        await ThrowIfBouncedAsync("Step 6 — passenger details");
+
+        // ── Step 6b — Payment-method page: pick BHIM/UPI → Continue ───
+        await Step6b_SelectPaymentMethodAsync();
+        await ThrowIfBouncedAsync("Step 6b — payment method");
+
+        // ── Step 7 — Stop for user-managed CAPTCHA/challenge ─────────
+        await Step7_ResolveCaptchaAsync();
+        await ThrowIfBouncedAsync("Step 7 — captcha");
+
+        // ── Step 8 — Click Continue → "Pay & Book" page ──────────────
+        await Step8_ContinueToReviewAsync();
+        await ThrowIfBouncedAsync("Step 8 — continue to review");
+
+        // ── Step 9 — Click Pay & Book → gateway redirect ─────────────
+        await Step9_PayAndBookAsync();
+
+        // ── Step 10 — Extract UPI QR and show in popup ───────────────
+        await Step10_CaptureQrAsync();
+    }
+
+    // Checks for both known IRCTC failure pages right now: the app-level
+    // "please try again" bounce (retried — see BookingBouncedException) and
+    // Akamai's own edge block (never retried — see CheckAkamaiBlockAsync).
+    // Called between steps so either is caught as soon as it appears rather
+    // than only at the couple of points they were first noticed at.
+    private async Task ThrowIfBouncedAsync(string afterStep)
+    {
+        await InjectAsync();
+        await CheckAkamaiBlockAsync(afterStep);
+        if (await ExecBool(BookingFailedJs))
+            throw new BookingBouncedException(afterStep);
+    }
+
+    // Detects Akamai's own "Unable to Process Request !!" edge block —
+    // distinct from IRCTC's app-level bounce page. This is the anti-bot
+    // layer itself rejecting the request (reference id + client IP printed
+    // right on the page), not a normal session/transaction hiccup, so unlike
+    // BookingFailedJs this is NOT retried: automatically restarting past a
+    // bot-detection block would be evasion, which this app deliberately does
+    // not do. Instead: capture full diagnostics (screenshot/HTML/headers,
+    // same as every other AccessDenied case), surface the reference and
+    // client IP so the user has something concrete to act on, and stop.
+    private async Task CheckAkamaiBlockAsync(string atStep)
+    {
+        if (!await ExecBool(AkamaiBlockedJs)) return;
+
+        string bodyText = "";
+        try { bodyText = (await Exec("document.body ? document.body.innerText : ''")).Trim('"'); } catch { }
+
+        var refMatch = System.Text.RegularExpressions.Regex.Match(
+            bodyText, @"\b\d\.[0-9a-f]{4,}\.\d{6,}\.[0-9a-f]{4,}\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var ipMatch = System.Text.RegularExpressions.Regex.Match(
+            bodyText, @"Client IP:\s*([\d.]+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var refPart = refMatch.Success ? $" Reference: {refMatch.Value}." : "";
+        var ipPart  = ipMatch.Success  ? $" Client IP: {ipMatch.Groups[1].Value}."  : "";
+
+        await AccessDeniedDiagnostics.CaptureAsync(_wv.CoreWebView2, AutomationFailureKind.AccessDenied,
+            detail: $"Akamai 'Unable to Process Request' block at {atStep}.{refPart}{ipPart}",
+            useProxy: _usingProxy, proxy: _proxy, bodyText: bodyText);
+
+        Report($"Blocked by IRCTC's Akamai edge (\"Unable to Process Request\") at {atStep}.{refPart}{ipPart} " +
+               "This is a bot-detection block from the site itself, not an app error — the booking has been " +
+               "stopped rather than retried, since retrying automatically past this would just be evading the " +
+               "block. Diagnostics were saved; if this keeps happening, it's worth checking whether the same " +
+               "IRCTC account is logged in from more than one parallel booking at once (IRCTC treats that as " +
+               "suspicious on its own).");
+        throw new AutomationSiteFailureException(AutomationFailureKind.AccessDenied);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1068,6 +1216,15 @@ true;";
         Report("Step 5 — Checking for re-login prompt...");
         await D(1000); await InjectAsync();
 
+        // Checked here explicitly (not just at the end-of-step boundary in
+        // RunBookingStepsAsync) because this is exactly where it was
+        // observed live: after Book Now, instead of the re-login form,
+        // IRCTC's edge sometimes returns "Unable to Process Request !!"
+        // outright. Without this check the waits below would just time out
+        // silently and fall through to the generic "not detected, complete
+        // manually" prompt with no indication of what actually happened.
+        await CheckAkamaiBlockAsync("Step 5 — re-login prompt");
+
         bool needLogin = await WaitForAsync(
             @"__h.exists('input[placeholder=""User Name""]') || " +
             @"__h.exists('input[formcontrolname=""userid""]') || " +
@@ -1078,6 +1235,7 @@ true;";
             Report("Step 5 — Re-login required. Logging in automatically...");
             await LoginAsync(_lastUser, _lastPass);
             await D(1500); await InjectAsync();
+            await CheckAkamaiBlockAsync("Step 5 — after re-login submit");
         }
 
         // Confirm we reached the passenger form
@@ -1341,16 +1499,18 @@ true;";
     }
 
     // ── BHIM/UPI payment radio (PrimeNG p-radiobutton) ─────────────────────
-    private async Task SelectUpiPaymentAsync()
-    {
-        await InjectAsync();
-
-        // PrimeNG renders the visible radio as a .ui-radiobutton-box div next to
-        // a hidden <input type=radio>. We must click the BOX or its label.
-        bool clicked = await ClickAsync(@"(function(){
+    // Exactly ONE .click() on the resolved target — no verify-then-click-again
+    // fallback. IRCTC's anti-bot layer flags repeated activations on the same
+    // control (see ClickDomAsync's comment and the "Sorry!! Please Try again"
+    // history on Pay & Book/Continue elsewhere in this flow); the same
+    // discipline applies here. Step6b_SelectPaymentMethodAsync polls for the
+    // resulting checked-state afterward instead of re-clicking if it's slow
+    // to reflect.
+    private Task<bool> SelectUpiPaymentAsync() => ClickDomAsync(@"(function(){
   function txt(e){ return (e ? (e.innerText||'') : '').toUpperCase(); }
 
-  // 1) Find a label / container mentioning UPI or BHIM
+  // Find a label/container mentioning UPI or BHIM, and prefer the radio
+  // box within its row over the label itself.
   var labels = Array.from(document.querySelectorAll('label,div,span,td'))
     .filter(function(e){
        var t = txt(e);
@@ -1360,52 +1520,12 @@ true;";
     .sort(function(a,b){ return a.innerText.length - b.innerText.length; });
 
   for (var lbl of labels) {
-    // Try to find the clickable radio box within or near this label
     var row = lbl.closest('.ui-radiobutton, .p-radiobutton, tr, .col-pad, div') || lbl;
     var box = row.querySelector('.ui-radiobutton-box, .p-radiobutton-box, .ui-radiobutton, .p-radiobutton');
     if (box && box.offsetParent !== null) return box;
   }
-  // 2) Fall back to the label itself
-  if (labels[0]) return labels[0];
-  return null;
+  return labels[0] || null;
 })()");
-
-        if (!clicked)
-        {
-            // Last resort: click any radiobutton box whose row text has UPI
-            await ClickText("label,div,span", "BHIM/UPI");
-        }
-
-        await D(500); await InjectAsync();
-
-        // Verify the radio is now checked; if not, click the hidden input directly
-        bool ok = await ExecBool(@"(function(){
-  var r = Array.from(document.querySelectorAll('input[type=""radio""]'))
-    .find(function(x){
-       var v=(x.value||x.id||'').toLowerCase();
-       var lbl=document.querySelector('label[for=""'+x.id+'""]');
-       return v.includes('upi')||v.includes('bhim')
-           || (lbl && /upi|bhim/i.test(lbl.innerText||''));
-    });
-  return r && r.checked;
-})()");
-
-        if (!ok)
-        {
-            await Exec(@"(function(){
-  var r = Array.from(document.querySelectorAll('input[type=""radio""]'))
-    .find(function(x){
-       var v=(x.value||x.id||'').toLowerCase();
-       var lbl=document.querySelector('label[for=""'+x.id+'""]');
-       return v.includes('upi')||v.includes('bhim')
-           || (lbl && /upi|bhim/i.test(lbl.innerText||''));
-    });
-  if(r){ r.checked=true;
-         r.click();
-         r.dispatchEvent(new Event('change',{bubbles:true})); }
-})();");
-        }
-    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP 6b — Payment-method page: select BHIM/UPI radio → Continue
@@ -1421,31 +1541,18 @@ true;";
               || __h.pageHas('Convenience Fee')", 12000);
         await D(800); await InjectAsync();
 
-        // 1) Select BHIM/UPI — best-effort with a few retries. We do NOT hard-gate
-        //    on verification here, because the visible orange dot can register
-        //    inconsistently; the Continue step below confirms real progress.
-        for (int i = 0; i < 4; i++)
-        {
-            await SelectUpiPaymentAsync();
-            await D(600); await InjectAsync();
-            if (await ExecBool(UpiVerifyJs())) { Report("Step 6b — BHIM/UPI selected."); break; }
-            Report($"Step 6b — Re-selecting BHIM/UPI ({i + 1}/4)...");
-        }
-
-        // 2) Re-assert the UPI radio, then click Continue EXACTLY ONCE and wait.
-        //    IRCTC rejects double-clicks ("Sorry!! Please Try again"), so we must
-        //    NOT retry the Continue click — click once, then poll for progress.
-        await Exec(@"(function(){
-  var r = Array.from(document.querySelectorAll('input[type=""radio""]')).find(function(x){
-    var v=(x.value||x.id||'').toLowerCase();
-    var lbl=document.querySelector('label[for=""'+x.id+'""]');
-    return v.includes('upi')||v.includes('bhim')
-        || (lbl && /upi|bhim/i.test(lbl.innerText||''));
-  });
-  if(r && !r.checked){ r.checked=true; r.click();
-                       r.dispatchEvent(new Event('change',{bubbles:true})); }
-})();");
-        await D(250);
+        // 1) Select BHIM/UPI — exactly ONE click (see SelectUpiPaymentAsync).
+        //    Verification (the orange dot) can register a little late, so we
+        //    poll for it briefly afterward, but we never click again to "make
+        //    sure" — that's what used to fire multiple activations at the
+        //    same control. If it's still not confirmed after the poll we
+        //    proceed anyway; the Continue step below confirms real progress.
+        await SelectUpiPaymentAsync();
+        bool upiSelected = await WaitForAsync(UpiVerifyJs(), 4000, pollMs: 300);
+        Report(upiSelected
+            ? "Step 6b — BHIM/UPI selected."
+            : "Step 6b — BHIM/UPI selection not visually confirmed; continuing anyway.");
+        await InjectAsync();
 
         const string leftPaymentMethodJs = @"__h.captchaVisible() || __h.pageHas('Enter Captcha')
               || Array.from(document.querySelectorAll('button,a')).some(function(b){
@@ -1689,6 +1796,19 @@ true;";
       var t=(document.body.innerText||'').toLowerCase();
       return (t.includes('please try again') || t.includes('sorry'))
           && (t.includes('to login') || t.includes('click here'));
+    })()";
+
+    // true when Akamai's edge itself has outright blocked the request —
+    // IRCTC's raw bot-management/WAF error page ("Unable to Process
+    // Request !!" + a reference id + "Client IP: ..."), NOT an app-level
+    // "please try again" bounce. This is a different situation and is
+    // handled differently (see CheckAkamaiBlockAsync): it is reported and
+    // the booking is stopped, never auto-retried — retrying past an edge
+    // block automatically would just be evading Akamai's bot detection,
+    // which this app does not do.
+    private const string AkamaiBlockedJs = @"(function(){
+      var t=(document.body.innerText||'').toLowerCase();
+      return t.includes('unable to process request');
     })()";
 
     // true while we are STILL on the Payment Methods page (heading + BHIM/UPI/USSD
@@ -2028,14 +2148,12 @@ true;";
         // After Pay & Book, IRCTC either shows the payment gateway/QR OR bounces to
         // its "Sorry!! please Try Again / To login click here" error page (session /
         // transaction rejected). Detect the failure so we don't wait at Step 10 for
-        // a QR that will never come.
+        // a QR that will never come — throwing BookingBouncedException lets
+        // RunAsync click through and restart the whole booking instead of
+        // just giving up.
         if (await WaitForAsync(BookingFailedJs, 4000))
         {
-            Report("IRCTC rejected the booking (\"Sorry, please Try Again\" / login page). " +
-                   "The session was lost or the transaction was declined — restart the booking.");
-            throw new Exception(
-                "IRCTC returned its 'Sorry, please Try Again' page after Pay & Book — " +
-                "the booking session was rejected. Start the booking again.");
+            throw new BookingBouncedException("Step 9 — after Pay & Book");
         }
     }
 
@@ -2082,13 +2200,10 @@ true;";
             await D(1500); await InjectAsync();
 
             // Bail out if IRCTC has shown its 'Sorry, please Try Again' / login page —
-            // the QR will never come.
+            // the QR will never come. Throwing (rather than returning) lets
+            // RunAsync click through and restart the whole booking.
             if (await ExecBool(BookingFailedJs))
-            {
-                Report("Step 10 — IRCTC error page detected (\"Sorry, please Try Again\"). " +
-                       "Booking was rejected; no QR will appear. Restart the booking.");
-                return;
-            }
+                throw new BookingBouncedException("Step 10 — waiting for QR");
 
             // 0) Some gateways show a placeholder with "Click here to pay through QR".
             //    Click it ONCE to render the real scannable QR. Confirmed via a live
